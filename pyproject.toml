@@ -1,0 +1,15 @@
+[build-system]
+requires = [
+   "setuptools",
+   "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hofft"
+version = "0.0.1"
+authors = [
+  { name="Daniel Abraham", email="abrahamd@stanford.edu" },
+]
+description = "A package for modeling high order phases in MRI"
+readme = "README.md"
