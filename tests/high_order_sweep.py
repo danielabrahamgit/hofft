@@ -16,7 +16,7 @@ from mr_recon.imperfections.field import b0_to_phis_alphas, coco_to_phis_alphas,
 from mr_recon.fourier import gridded_nufft, ifft, fft, lr_nufft, matrix_nufft, sigpy_nufft, svd_nufft
 from mr_recon.utils import gen_grd, normalize, np_to_torch  
 from mr_recon.spatial import spatial_resize
-from mr_recon.calib import synth_cal
+from mr_recon.multi_coil.calib import synth_cal
 from mr_recon.spatial import spatial_resize_poly
 
 from igrog.kernel_linop import fixed_kern_naive_linop

@@ -10,7 +10,7 @@ from einops import einsum, rearrange
 from mr_recon.linops import experimental_sense, batching_params, type3_nufft_naive, type3_nufft
 from mr_recon.recons import CG_SENSE_recon
 from mr_recon.imperfections.field import b0_to_phis_alphas, coco_to_phis_alphas, alpha_phi_svd, alpha_segementation, isotropic_cluster_alphas
-from mr_recon.calib import synth_cal
+from mr_recon.multi_coil.calib import synth_cal
 from mr_recon.fourier import gridded_nufft, ifft, sigpy_nufft
 from mr_recon.utils import gen_grd, np_to_torch  
 from mr_recon.spatial import spatial_resize_poly
