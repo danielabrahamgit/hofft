@@ -1,94 +1,78 @@
+import re
 import torch
 import numpy as np
 
-from typing import Optional
+from typing import Optional, Union
 from einops import einsum, rearrange
+from dataclasses import dataclass
 
 from mr_recon.utils import gen_grd, resize, quantize_data
 from mr_recon.spatial import spatial_interp
 from mr_recon.algs import eigen_decomp_operator, lin_solve
 from mr_recon.imperfections.field import alpha_segementation
-from mr_recon.fourier import fft, ifft, sigpy_nufft, matrix_nufft, torchkb_nufft, _torch_apodize
+from mr_recon.fourier import fft, ifft, sigpy_nufft, matrix_nufft, torchkb_nufft
 from mr_recon.linops import linop, type3_nufft_naive, type3_nufft
 from mr_recon.dtypes import complex_dtype
 
+from hofft.apod_init import K_alphas_apod_init, alpha_seg_apod_init, eigen_apod_init
 from hofft.als import als_iterations, lstsq_temporal
 from hofft.sgd import train_net_apod
+from hofft.kb import kb_weights_1d, kb_apod_1d, sample_kb_kernel, _gen_kern_bases
+from hofft.model import hofft_params
 
 __all__ = [
+    'funcs_to_phase',
     'kb_nufft',
     'als_nufft',
     'als_hofft',
     'mlp_hofft',
 ]
 
-def kb_weights_1d(x: torch.Tensor,
-                  beta: float) -> torch.Tensor:
+def funcs_to_phase(weights: torch.Tensor,
+                   apods: torch.Tensor,
+                   os: Optional[float] = 1.0) -> torch.Tensor:
     """
-    Kaiser Bessel kernel function in 1D
+    Convert weights and apodization functions to phase maps
     
-    Parameters:
-    -----------
-    x : torch.tensor
-        input scaled between [-1, 1] arb shape
-    beta : float
-        beta parameter for kaiser bessel kernel
-    
-    Returns:
-    ----------
-    k : torch.tensor
-        kaiser bessel evaluation kb(x) with same shape as x
-    """
-    x = beta * (1 - x**2) ** 0.5
-    t = x / 3.75
-    k1 = (  1
-            + 3.5156229 * t**2
-            + 3.0899424 * t**4
-            + 1.2067492 * t**6
-            + 0.2659732 * t**8
-            + 0.0360768 * t**10
-            + 0.0045813 * t**12)
-    k2 = (  x**-0.5
-            * torch.exp(x)
-            * (
-                0.39894228
-                + 0.01328592 * t**-1
-                + 0.00225319 * t**-2
-                - 0.00157565 * t**-3
-                + 0.00916281 * t**-4
-                - 0.02057706 * t**-5
-                + 0.02635537 * t**-6
-                - 0.01647633 * t**-7
-                + 0.00392377 * t**-8))
-    return k1 * (x < 3.75) + k2 * (x >= 3.75)
- 
-def kb_apod_1d(x: torch.Tensor,
-               beta: float,
-               width: float) -> torch.Tensor:
-    """
-    1D apodization for the Kasier Bessel Kernel
-    
-    Parameters:
-    -----------
-    x : torch.Tensor <float>
-        Arb shape signal between [-1/2, 1/2]
-    beta : float
-        beta parameter for kaiser bessel kernel
-    width : float
-        width of the kernel in pixels
+    Args
+    ----
+    weights : torch.Tensor
+        NUFFT kernel weights with shape (L, *kern_size, *trj_size)
+    apods : torch.Tensor
+        Apodization functions with shape (L, *im_size)
+    os : Optional[float]
+        Oversampling factor.
         
-    Returns:
-    --------
-    apod : torch.Tensor <float>
-        apodization evaluated at input x
+    Returns
+    -------
+    phz : torch.Tensor
+        Phase maps with shape (*trj_size, *im_size)
     """
+    # Consts
+    kern_size = weights.shape[1:-1]
+    im_size = apods.shape[1:]
+    torch_dev = weights.device
+    d = len(im_size)
+    trj_size = weights.shape[(d+1):]
+    L = weights.shape[0]
+    K = np.prod(kern_size)
+    T = np.prod(trj_size)
+    
+    # Flatten
+    weights_flt = weights.reshape((L, K, T))
+    
+    # Make kernel bases
+    rs = gen_grd(im_size).to(torch_dev)
+    kern = gen_grd(kern_size, kern_size).to(torch_dev).reshape((-1, d)) / os
+    phz = einsum(kern, rs, 'K D, ... D -> K ...')
+    kern_bases = torch.exp(-2j * np.pi * phz)
+    
+    # Apply
+    phz = einsum(weights_flt, kern_bases, 'L K T, K ... -> L T ...')
+    phz = einsum(phz, apods, 'L T ..., L ... -> T ...')
+    
+    return phz.reshape((*trj_size, *im_size))
 
-    apod = (
-        beta**2 - (np.pi * width * x) ** 2
-    ) ** 0.5
-    apod /= torch.sinh(apod)
-    return apod
- 
 def kb_nufft(trj: torch.Tensor,
              im_size: tuple,
              kern_size: tuple,
@@ -96,8 +80,8 @@ def kb_nufft(trj: torch.Tensor,
     """
     Multi-apodization non-uniform FFT (NUFFT)
     
-    Args:
-    -----
+    Args
+    ----
     trj : torch.Tensor
         k-space trajectory with shape (*trj_size, d)
     im_size : tuple
@@ -107,8 +91,8 @@ def kb_nufft(trj: torch.Tensor,
     os : Optional[float]
         Oversampling factor.
     
-    Returns:
-    --------
+    Returns
+    -------
     weights : torch.Tensor
         KB-NUFFT kernel weights with shape (1, *kern_size, *trj_size)
     apods : torch.Tensor
@@ -129,23 +113,29 @@ def kb_nufft(trj: torch.Tensor,
     apod = kb_apod_1d(rs / os, beta, width).prod(dim=-1)
     
     # Kernel weights
-    kern = gen_grd(kern_size, kern_size).reshape((-1, d)).to(trj.device)
-    kern -= kern.mean(dim=0)
-    kdevs = (trj - (os * trj).round()/os)
-    pts = (kdevs[..., None, :] * os - kern) / (width / 2)
-    weights = torch.prod(kb_weights_1d(pts, beta), dim=-1)
-    weights = torch.nan_to_num(weights, nan=0.0)
+    kdevs = trj - (os * trj).round()/os
+    weights = sample_kb_kernel(kdevs, kern_size, os, beta)
+    
+    # Scaling factor correction
+    # kdev = torch.zeros((1, d), dtype=torch.float32, device=trj.device)
+    # weights_scale = sample_kb_kernel(kdev, kern_size, os, beta).flatten()
+    # kern_bases = _gen_kern_bases(im_size, kern_size, os).to(trj.device)
+    # ones_est = einsum(weights_scale.type(complex_dtype), apod * kern_bases, 
+    #                   'L, L ... -> ...')
+    # # apod = apod / ones_est
+    # apod = torch.exp(-ones_est.angle()) * apod / ones_est.abs().mean()
+    apod /= width ** d
     
     # Reshape
     apods = apod[None,]
-    weights = weights.moveaxis(-1, 0).reshape((1, *kern_size, *trj_size))
-    weights = weights.type(complex_dtype)
+    weights = weights[None,].type(complex_dtype)
     
-    # Apply correction linear phase
-    k_corr = torch.ones(d, device=trj.device) / os / 2
-    phz = torch.exp(-2j * np.pi * einsum(rs, k_corr, '... d, d -> ...'))
+    # # Apply correction linear phase
+    # k_corr = (width%2==0)*torch.ones(d, device=trj.device) / os / 2
+    # phz = torch.exp(-2j * np.pi * einsum(rs, k_corr, '... d, d -> ...'))
+    # apods = apods * phz
 
-    return weights, apods * phz
+    return weights, apods
 
 def als_nufft(trj: torch.Tensor,
               im_size: tuple,
@@ -159,8 +149,8 @@ def als_nufft(trj: torch.Tensor,
     """
     Multi-apodization non-uniform FFT (NUFFT)
     
-    Args:
-    -----
+    Args
+    ----
     trj : torch.Tensor
         k-space trajectory with shape (*trj_size, d)
     im_size : tuple
@@ -180,8 +170,8 @@ def als_nufft(trj: torch.Tensor,
     verbose : Optional[bool]
         If True, prints progress of ALS iterations.
     
-    Returns:
-    --------
+    Returns
+    -------
     weights : torch.Tensor
         NUFFT kernel weights with shape (L, *kern_size, *trj_size)
     apods : torch.Tensor
@@ -203,8 +193,8 @@ def als_nufft(trj: torch.Tensor,
     kern_bases = torch.exp(-2j * np.pi * phz)
 
     # Initialize apodization functions with eigen-vectors
-    high_acc_nufft = matrix_nufft(solve_size)
-    # high_acc_nufft = sigpy_nufft(solve_size, oversamp=2.0, width=6)
+    # high_acc_nufft = matrix_nufft(solve_size)
+    high_acc_nufft = sigpy_nufft(solve_size, oversamp=2.0, width=6)
     # high_acc_nufft = torchkb_nufft(solve_size, torch_dev)
     kdevs_rs = high_acc_nufft.rescale_trajectory(kdevs)
     if init_method == 'eigen':
@@ -253,18 +243,13 @@ def als_nufft(trj: torch.Tensor,
 def als_hofft(phis: torch.Tensor,
               alphas: torch.Tensor,
               im_size: tuple,
-              kern_size: tuple,
-              os: Optional[float] = 1.0,
-              L: Optional[int] = 1,
-              num_als_iter: Optional[int] = 100,
-              init_method: Optional[str] = 'eigen',
-              use_type3: Optional[bool] = True,
-              verbose: Optional[bool] = True,) -> tuple[torch.Tensor, torch.Tensor]:
+              hparams: hofft_params,
+              num_als_iter: Optional[int] = 100) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Multi-apodization HOFFT model, allowing for arbitrary non-linear phase
     
-    Args:
-    -----
+    Args
+    ----
     phis : torch.Tensor
         Spatial phase maps with shape (B, *solve_size)
         where solve_size is likely smaller than the image size, but has the same number of dimensions.
@@ -272,23 +257,13 @@ def als_hofft(phis: torch.Tensor,
         Temporal phase coefficients with shape (B, *trj_size)
     im_size : tuple
         Size of the image to be reconstructed.
-    kern_size : tuple
-        Size of the kernel, must have the same number of dimensions as the image.
-    os : Optional[float]
-        Oversampling factor.
-    L : Optional[int]
-        Number of apodization functions.
+    hparams : hofft_params
+        HOFFT parameters.
     num_als_iter : Optional[int]
         Number of ALS iterations.
-    init_method : Optional[str]
-        Method to initialize apodization functions. Options are 'eigen' or 'seg'.
-    use_type3 : Optional[bool]
-        If True, uses type3 nufft for the forward and adjoint operations.
-    verbose : Optional[bool]
-        If True, prints progress of ALS iterations.
-    
-    Returns:
-    --------
+        
+    Returns
+    -------
     weights : torch.Tensor
         NUFFT kernel weights with shape (L, *kern_size, *trj_size)
     apods : torch.Tensor
@@ -299,23 +274,43 @@ def als_hofft(phis: torch.Tensor,
     solve_size = phis.shape[1:]
     torch_dev = phis.device
     d = len(im_size)
+    kern_size = hparams.kern_size
+    os = hparams.os
+    L = hparams.L
+    apods_init = hparams.apods_init
+    use_type3 = hparams.use_type3
+    verbose = hparams.verbose
     
     # Make kernel bases
     rs = gen_grd(solve_size).to(torch_dev)
     kern = gen_grd(kern_size, kern_size).to(torch_dev).reshape((-1, d)) / os
     phz = einsum(kern, rs, 'K D, ... D -> K ...')
     kern_bases = torch.exp(-2j * np.pi * phz)
-
-    # Initialize apodization functions with eigen-vectors
+    
+    # Make type3 object
     if use_type3:
         t3n = type3_nufft(phis, alphas, use_toep=True)
     else:
         t3n = type3_nufft_naive(phis, alphas)
-    if init_method == 'eigen':
-        x0 = torch.randn(solve_size, dtype=complex_dtype, device=torch_dev)
-        apods, _ = eigen_decomp_operator(t3n.normal, x0, num_eigen=L, verbose=verbose)
+
+    # Initialize apodization functions
+    if isinstance(apods_init, torch.Tensor):
+        apods = apods_init
+    elif isinstance(apods_init, str):
+        if 'eig' in apods_init:
+            apods = eigen_apod_init(phis, alphas, hparams)
+        elif 'seg' in apods_init:
+            apods = alpha_seg_apod_init(phis, alphas, hparams)
+        elif re.fullmatch(r"\d+_alphas", apods_init):
+            K = int(apods_init.split('_')[0])
+            apods = K_alphas_apod_init(phis, alphas, hparams, 
+                                       method='minmax',
+                                       apod_init_method='seg',
+                                       num_als_iter=100, K=K)
+        else:
+            raise ValueError(f'Invalid apods_init {apods_init}. Supported methods are seg, eigen, and k_alphas.')
     else:
-        apods, _ = alpha_segementation(phis, alphas, L=L, L_batch_size=L, use_type3=use_type3)
+        raise ValueError("apods_init must be a torch.Tensor or a string")
 
     # ALS to solve for weights and apods
     weights, apods = als_iterations(t3n, kern_bases, apods, max_iter=num_als_iter, verbose=verbose)
@@ -334,42 +329,30 @@ def als_hofft(phis: torch.Tensor,
 def mlp_hofft(phis: torch.Tensor,
               alphas: torch.Tensor,
               im_size: tuple,
-              kern_size: tuple,
-              os: Optional[float] = 1.0,
-              L: Optional[int] = 1,
-              opt_apods: Optional[bool] = True,
-              epochs: Optional[int] = 100,
-              use_type3: Optional[bool] = True,
-              verbose: Optional[bool] = True,) -> tuple[torch.Tensor, torch.Tensor, torch.nn.Module]:
+              hparams: hofft_params,
+              opt_apods: bool = True,
+              epochs: int = 100) -> tuple[torch.Tensor, torch.Tensor, torch.nn.Module]:
     """
     Multi-apodization HOFFT model, allowing for arbitrary non-linear phase
     
-    Args:
-    -----
+    Args
+    ----
     phis : torch.Tensor
         Spatial phase maps with shape (B, *solve_size)
     alphas : torch.Tensor
         Temporal phase coefficients with shape (B, *trj_size)
     im_size : tuple
         Size of the image to be reconstructed.
-    kern_size : tuple
-        Size of the kernel, must have the same number of dimensions as the image.
-    os : Optional[float]
-        Oversampling factor.
-    L : Optional[int]
-        Number of apodization functions.
-    opt_apods : Optional[bool]
+    hparams : hofft_params
+        HOFFT parameters.
+    opt_apods : bool
         If True, optimizes the apodization functions.
         If False, uses the initial apodization functions.
-    num_als_iter : Optional[int]
-        Number of ALS iterations.
-    use_type3 : Optional[bool]
-        If True, uses type3 nufft for the forward and adjoint operations.
-    verbose : Optional[bool]
-        If True, prints progress of ALS iterations.
-    
-    Returns:
-    --------
+    epochs : int
+        Number of epochs to train the MLP.
+        
+    Returns
+    -------
     weights : torch.Tensor
         NUFFT kernel weights with shape (L, *kern_size, *trj_size)
     apods : torch.Tensor
@@ -383,16 +366,34 @@ def mlp_hofft(phis: torch.Tensor,
     torch_dev = phis.device
     d = len(im_size)
     B = phis.shape[0]
+    kern_size = hparams.kern_size
+    os = hparams.os
+    L = hparams.L
+    apods_init = hparams.apods_init
+    use_type3 = hparams.use_type3
+    verbose = hparams.verbose
     
-    # Initialize apodization functions with eigen-vectors
-    if use_type3:
-        t3n = type3_nufft(phis, alphas, use_toep=True)
+    # Initialize apodization functions
+    if isinstance(apods_init, torch.Tensor):
+        apods = apods_init
+    elif isinstance(apods_init, str):
+        if apods_init == 'eigen':
+            apods = eigen_apod_init(phis, alphas, hparams)
+        elif apods_init == 'seg':
+            apods = alpha_seg_apod_init(phis, alphas, hparams)
+        elif re.fullmatch(r"\d+_alphas", apods_init):
+            K = int(apods_init.split('_')[0])
+            apods = K_alphas_apod_init(phis, alphas, hparams,
+                                       method='minmax',
+                                       apod_init_method='seg',
+                                       num_als_iter=100, K=K)
+        else:
+            raise ValueError(f'Invalid apods_init {apods_init}. Supported methods are seg, eigen, and k_alphas.')
     else:
-        t3n = type3_nufft_naive(phis, alphas)
-    x0 = torch.randn(solve_size, dtype=complex_dtype, device=torch_dev)
-    apods_init, _ = eigen_decomp_operator(t3n.normal, x0, num_eigen=L, verbose=verbose)
+        raise ValueError("apods_init must be a torch.Tensor or a string")
     
-    weights, apods, kern_model = train_net_apod(phis, alphas, apods_init, kern_size, os, opt_apods=opt_apods, epochs=epochs)
+    # Train MLP
+    weights, apods, kern_model = train_net_apod(phis, alphas, apods, kern_size, os, opt_apods=opt_apods, epochs=epochs)
     
     # Interpolate spatial funcs
     kwargs = {'order': 3, 'mode': 'nearest'}
@@ -401,6 +402,62 @@ def mlp_hofft(phis: torch.Tensor,
     apods = spatial_interp(apods, spatial_crds, **kwargs)
     
     return weights, apods, kern_model
+
+def coil_hofft(phis: torch.Tensor,
+               alphas: torch.Tensor,
+               mps: torch.Tensor,
+               hparams: hofft_params,
+               num_als_iter: Optional[int] = 100) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes HOFFT coefficients when coil sensitivity maps are used.
+    
+    Args
+    ----
+    phis : torch.Tensor
+        Spatial phase maps with shape (B, *solve_size)
+        where solve_size is likely smaller than the image size, but has the same number of dimensions.
+    alphas : torch.Tensor
+        Temporal phase coefficients with shape (B, *trj_size)
+    mps : torch.Tensor
+        Coil sensitivity maps with shape (C, *im_size)
+    hparams : hofft_params
+        HOFFT parameters.
+    num_als_iter : Optional[int]
+        Number of ALS iterations.
+        
+    Returns
+    -------
+    weights : torch.Tensor
+        NUFFT kernel weights with shape (C, C, L, *kern_size, *trj_size)
+    apods : torch.Tensor
+        Apodization functions with shape (L, *im_size)
+    """
+    # Consts
+    im_size = mps.shape[1:]
+    trj_size = alphas.shape[1:]
+    solve_size = phis.shape[1:]
+    torch_dev = phis.device
+    d = len(im_size)
+    kern_size = hparams.kern_size
+    os = hparams.os
+    L = hparams.L
+    apods_init = hparams.apods_init
+    use_type3 = hparams.use_type3
+    verbose = hparams.verbose
+    
+    # Make kernel bases
+    rs = gen_grd(solve_size).to(torch_dev)
+    kern = gen_grd(kern_size, kern_size).to(torch_dev).reshape((-1, d)) / os
+    phz = einsum(kern, rs, 'K D, ... D -> K ...')
+    kern_bases = torch.exp(-2j * np.pi * phz)
+    
+    # Make type3 object
+    if use_type3:
+        t3n = type3_nufft(phis, alphas, use_toep=True)
+    else:
+        t3n = type3_nufft_naive(phis, alphas)
+
+    
 
 def idonttrustthis(phis: torch.Tensor,
                    alphas: torch.Tensor,

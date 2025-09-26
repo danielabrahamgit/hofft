@@ -10,16 +10,16 @@ from einops import einsum, rearrange
 from tqdm import tqdm
 
 from mr_recon.spatial import spatial_resize, spatial_interp
-from mr_recon.linops import experimental_sense, batching_params, type3_nufft_naive, type3_nufft
+from mr_recon.linops import sense_linop, batching_params, type3_nufft_naive, type3_nufft
 from mr_recon.recons import CG_SENSE_recon, coil_combine
 from mr_recon.imperfections.field import b0_to_phis_alphas, coco_to_phis_alphas, alpha_phi_svd, alpha_segementation
-from mr_recon.fourier import gridded_nufft, ifft, fft, lr_nufft, matrix_nufft, sigpy_nufft, svd_nufft
+from mr_recon.fourier import gridded_nufft, ifft, fft, matrix_nufft, sigpy_nufft, svd_nufft
 from mr_recon.utils import gen_grd, normalize, np_to_torch  
 from mr_recon.spatial import spatial_resize
 
 from igrog.kernel_linop import fixed_kern_naive_linop
 # from als import init_apods, als_iterations
-from hofftify import kb_nufft, mlp_hofft, als_nufft
+from hofft import kb_nufft, mlp_hofft, als_nufft
 
 
 # Params
@@ -29,8 +29,8 @@ R = 3
 
 np.random.seed(0)
 torch.manual_seed(0)
-torch.backends.cudnn.benchmark = False
-torch.use_deterministic_algorithms(True)
+# torch.backends.cudnn.benchmark = False
+# torch.use_deterministic_algorithms(True)
 
 # load data
 fpath = '/local_mount/space/mayday/data/users/abrahamd/60_shot/data/'
@@ -131,7 +131,7 @@ for n in tqdm(range(len(idxs))):
 # Save ground truth
 nufft = sigpy_nufft(im_size, 2.0, 6)
 # nufft = matrix_nufft(im_size, spatial_batch_size=220 * 10)
-A = experimental_sense(trj, mps, dcf, nufft=nufft)
+A = sense_linop(trj, mps, dcf, nufft=nufft)
 img_gt = CG_SENSE_recon(A, ksp, max_iter=10, max_eigen=1.0, verbose=True).cpu()
 torch.save(img_gt, './lin_phase_experiments/img_gt.pt')
 quit()

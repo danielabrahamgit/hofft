@@ -7,26 +7,19 @@ import matplotlib.pyplot as plt
 
 from einops import einsum, rearrange
 
-from mr_recon.linops import experimental_sense, batching_params, type3_nufft_naive, type3_nufft
+from mr_recon.linops import batching_params, sense_linop
 from mr_recon.recons import CG_SENSE_recon
 from mr_recon.imperfections.field import b0_to_phis_alphas, coco_to_phis_alphas, alpha_phi_svd, alpha_segementation, isotropic_cluster_alphas
 from mr_recon.multi_coil.calib import synth_cal
 from mr_recon.fourier import gridded_nufft, ifft, sigpy_nufft
 from mr_recon.utils import gen_grd, np_to_torch  
 from mr_recon.spatial import spatial_resize_poly
-from mr_recon.spatial import (
-    spatial_interp, 
-    spatial_resize, 
-    spatial_resize_poly,
-    apply_interp_kernel,
-    get_interp_kernel
-)
-from mr_recon.gp import gp_model, optimize_hyper
+from mr_recon.interpolate import get_interp_kernel, apply_interp_kernel
 
 from igrog.kernel_linop import fixed_kern_naive_linop
 
 # from hofft import als_hofft, als_nufft, also_this_one, mlp_hofft, kb_nufft, idonttrustthis
-from hofft import als_hofft, als_iterations, als_nufft
+from hofft import als_hofft, als_iterations, als_nufft, kb_nufft, multi_apod_kern_linop
 
 # Set seeds
 torch.manual_seed(0)
@@ -59,9 +52,9 @@ ksp_cal = synth_cal(ksp_fs, (32, 32), trj_fs, dcf_fs, num_iter=1)
 img_cal = ifft(ksp_cal, dim=[-2,-1], oshape=mps.shape)
 
 # Get phis alphas from field imperfections
-xyz = gen_grd(im_size).to(torch_dev)
+xyz = gen_grd(im_size).to(torch_dev) * FOV
 xyz = torch.stack([xyz[..., 0], xyz[..., 0]*0, xyz[..., 1]], dim=-1)
-trj_physical = torch.stack([trj[..., 0], trj[..., 0]*0, trj[..., 1]], dim=-1) * FOV
+trj_physical = torch.stack([trj[..., 0], trj[..., 0]*0, trj[..., 1]], dim=-1) / FOV
 phis_coco, alphas_coco = coco_to_phis_alphas(trj_physical, xyz, 3, 0, dt)
 phis_b0, alphas_b0 = b0_to_phis_alphas(b0, dcf.shape, 0, dt)
 phis = torch.cat([phis_coco[:-2], phis_b0], dim=0)
@@ -82,8 +75,8 @@ alphas = torch.cat([alphas, kdevs], dim=0)
 
 phis_small = spatial_resize_poly(phis, solve_size, order=3)
 alphas_small = alphas
-M = 1000
-alphas_small = isotropic_cluster_alphas(alphas, phis, M)[0].T
+# M = 1000
+# alphas_small = isotropic_cluster_alphas(alphas, phis, M)[0].T
 # rnd_inds = np_to_torch(np.random.choice(alphas.shape[1], M, replace=True)).to(torch_dev)
 # alphas_small = alphas.reshape((alphas.shape[0], -1))[:, rnd_inds]
 
@@ -110,17 +103,6 @@ if (alphas_small.shape != alphas.shape) and \
     # Y = torch.cat([weights_flt[:, 5:6].real, weights_flt[:, 5:6].imag], dim=-1)
     X_pred = alphas.moveaxis(0, -1).reshape((-1, alphas.shape[0]))
     
-    # # ---------------- Fit GP Model ----------------
-    # model = gp_model(X, Y).to(torch_dev)
-    # model = optimize_hyper(model, X, Y, num_iter=80, lr=1e-1)
-    # model.eval()
-    # model.likelihood.eval()
-    # Y_pred = torch.zeros((X_pred.shape[0], Y.shape[1])).to(torch_dev)
-    # bs = 100
-    # for n1 in range(0, X_pred.shape[0], bs):
-    #     n2 = min(n1 + bs, X_pred.shape[0])
-    #     Y_pred[n1:n2] = model.predict(X_pred[n1:n2]).detach()
-    
     # ---------------- Fit RBF Model ----------------
     kern_weights, kern_func = get_interp_kernel(X, Y, 
                                                 kern_param=0.5,
@@ -144,7 +126,7 @@ if (alphas_small.shape != alphas.shape) and \
 # Build linop
 bparams = batching_params(mps.shape[0]*0+1,)
 trj_grd = (os * trj).round()/os
-# A = experimental_sense(mps=mps, dcf=dcf,
+# A = sense_linop(mps=mps, dcf=dcf,
 #                        spatial_funcs=b, 
 #                        temporal_funcs=h,
 #                        trj=trj_grd,
@@ -152,7 +134,7 @@ trj_grd = (os * trj).round()/os
 #                     #    trj=trj,
 #                     #    nufft=sigpy_nufft(im_size, oversamp=os, width=kern_size[0]),
 #                        bparams=bparams)
-A = fixed_kern_naive_linop(weights, apods, mps, trj_grd, dcf, os_grid=os, bparams=bparams)
+A = multi_apod_kern_linop(trj_grd, mps, weights, apods, dcf, os_grid=os, bparams=bparams)
 
 # Recon
 img = CG_SENSE_recon(A, ksp, max_iter=10, max_eigen=1.0).rot90()

@@ -8,21 +8,14 @@ import matplotlib.pyplot as plt
 from einops import einsum, rearrange
 from scipy.ndimage import gaussian_filter
 
-from mr_recon.linops import experimental_sense, batching_params, multi_chan_linop, type3_nufft_naive, type3_nufft
+from mr_recon.linops import batching_params, sense_linop
 from mr_recon.recons import CG_SENSE_recon, coil_combine
 from mr_recon.imperfections.field import b0_to_phis_alphas, coco_to_phis_alphas, alpha_phi_svd, alpha_segementation, isotropic_cluster_alphas
 from mr_recon.multi_coil.calib import synth_cal
 from mr_recon.fourier import gridded_nufft, ifft, sigpy_nufft
 from mr_recon.utils import gen_grd, np_to_torch  
 from mr_recon.spatial import spatial_resize_poly
-from mr_recon.spatial import (
-    spatial_interp, 
-    spatial_resize, 
-    spatial_resize_poly,
-    apply_interp_kernel,
-    get_interp_kernel
-)
-from mr_recon.gp import gp_model, optimize_hyper
+from mr_recon.interpolate import get_interp_kernel, apply_interp_kernel
 
 from igrog.kernel_linop import fixed_kern_naive_linop
 

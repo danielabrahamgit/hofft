@@ -107,8 +107,8 @@ def als_iterations(phase_model: linop,
     """
     Perform ALS iterations to solve for apodization functions and weights.
     
-    Args:
-    -----
+    Args
+    ----
     phase_model : mr_recon.linop
         linear operator for the phase operator
     kern_bases : torch.Tensor
@@ -122,8 +122,8 @@ def als_iterations(phase_model: linop,
     verbose : bool, optional
         whether to print progress
     
-    Returns:
-    --------
+    Returns
+    -------
     weights : torch.Tensor
         weights with shape (L, K, *trj_size)
     apods : torch.Tensor
@@ -142,7 +142,8 @@ def als_iterations(phase_model: linop,
     kwargs_allclose = {'atol': 0.0, 'rtol': 1e-2}
     
     # Momentum term
-    momentum = lambda k : .8#k / (k + 3)
+    # momentum = lambda k : k / (k + 3)
+    momentum = lambda k : .8
     k0 = 0
     
     # ALS till max_iter
@@ -186,8 +187,8 @@ def lstsq_spatial(phase_model: linop,
     This function optimizes for the apodization functions 
     given fixed weights via least squares.
     
-    Args:
-    -----
+    Args
+    ----
     phase_model : mr_recon.linops.linop
         linear operator for the phase operator
     kern_bases : torch.Tensor
@@ -205,8 +206,8 @@ def lstsq_spatial(phase_model: linop,
     lamda : float, optional
         regularization parameter for least squares
     
-    Returns:
-    --------
+    Returns
+    -------
     apods : torch.Tensor
         solution with shape (L, *im_size)
     """
@@ -270,8 +271,8 @@ def lstsq_temporal(phase_model: linop,
     """
     This function optimizes for the weights given fixed apodization functions.
     
-    Args:
-    -----
+    Args
+    ----
     phase_model : mr_recon.linops.linop
         linear operator for the phase operator
     kern_bases : torch.Tensor
@@ -287,8 +288,8 @@ def lstsq_temporal(phase_model: linop,
     lamda : float, optional
         regularization parameter for least squares    
     
-    Returns:
-    --------
+    Returns
+    -------
     weights : torch.Tensor
         weights with shape (L, K, *trj_size)
     """

@@ -2,15 +2,16 @@ import torch
 import torch.nn as nn
 import numpy as np
 import gc
-from tqdm import tqdm
 
+from tqdm import tqdm
 from einops import rearrange, einsum
 from typing import Optional, Mapping
+from dataclasses import dataclass
 
-from mr_recon.utils import np_to_torch, gen_grd
-
+from mr_recon.utils import gen_grd
 from hofft.kernel_models import learnable_kernels
 
+@dataclass
 class training_params:
     epochs: Optional[int] = 15
     batch_size: Optional[int] = 2 ** 14
@@ -136,7 +137,6 @@ class phase_dataset(object):
         valid_inds = torch.randint(0, len(self.valid_voxels), (batch_size,), device=self.device)
         r_inds = self.valid_voxels[valid_inds]
         r_batch = self.r[r_inds] # N d
-        p_batch = self.phis_train[r_inds] # N B
 
         # Apply Source
         source_batch = torch.exp(-2j * torch.pi * \
@@ -169,7 +169,7 @@ def train_net_apod(phis: torch.Tensor,
                    kern_size: tuple, 
                    os: float, 
                    opt_apods: Optional[bool] = True,
-                   epochs: Optional[int] = 100):
+                   epochs: Optional[int] = 100) -> tuple[torch.Tensor, torch.Tensor, nn.Module]:
     """
     Train a neural network to learn the kernel weights, 
     and grid representation of apodization functions.
@@ -210,8 +210,11 @@ def train_net_apod(phis: torch.Tensor,
     d = len(im_size)
     
     # Training parameters for the model
-    tparams = training_params(epochs=epochs*100, batches_per_epoch=1, batch_size=2**14, show_loss=True,
-                          loss=lambda x, y: (x-y).abs().square().sum(), lr=1e-3)
+    tparams = training_params(epochs=epochs*100, 
+                              batch_size=2**14, 
+                              show_loss=False, 
+                              loss=lambda x, y: (x-y).abs().square().sum(), 
+                              lr=1e-3)
     
     # Make kernel bases vectors
     kern_vecs = gen_grd(kern_size, kern_size)
@@ -223,14 +226,14 @@ def train_net_apod(phis: torch.Tensor,
     else:
         source_maps = apods_init.clone().type(torch.complex64).requires_grad_(False)
     target_maps = torch.ones((1, *im_size), device=torch_dev, dtype=torch.complex64)
-    kern_model = learnable_kernels(2, kern_size, im_size, source_maps, target_maps).to(torch_dev)
+    kern_model = learnable_kernels(B, kern_size, im_size, source_maps, target_maps).to(torch_dev)
     alphas_train = alphas.reshape((B, -1))
     dataset = phase_dataset(kern_vecs, kern_model.source_maps, kern_model.target_maps, 
                             alphas_train=alphas_train, 
                             phis_train=phis)
     
     # Train the model
-    kern_model = stochastic_train_fixed(kern_model, dataset, tparams, verbose=False)
+    kern_model = stochastic_train_fixed(kern_model, dataset, tparams, verbose=True)
     
     # Query model for weights
     weights = kern_model.forward_kernel(alphas_train.T) # T 1 L K
@@ -247,7 +250,7 @@ def stochastic_train_fixed(kernel_model: nn.Module,
                            data_loader: Mapping[int, dict],
                            train_params: training_params,
                            keep_grad: Optional[bool] = False,
-                           verbose: Optional[bool] = False,):
+                           verbose: Optional[bool] = False,) -> nn.Module:
     """
     Stochastically trains a model to estimate target points using linear 
     combinations of source points, where the linear functions are learned
@@ -326,4 +329,55 @@ def stochastic_train_fixed(kernel_model: nn.Module,
 
     torch.set_float32_matmul_precision(precision_old)
     return kernel_model 
-   
+ 
+def gradient_descent(phis: torch.Tensor, 
+                     alphas: torch.Tensor, 
+                     apods_init: torch.Tensor,
+                     kerns_init: torch.Tensor,
+                     os: float,
+                     epochs: Optional[int] = 100) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Train a neural network to learn the kernel weights, 
+    and grid representation of apodization functions.
+
+    Args:
+    -----
+    phis : torch.Tensor
+        The spatial phase bases with shape (B, *im_size).
+    alphas : torch.Tensor
+        The spatial apodization bases with shape (B, *trj_size).
+    apods_init : torch.Tensor
+        The initial apodization functions with shape (L, *im_size).
+    kerns_init : torch.Tensor
+        The initial kernel weights with shape (L, *kern_size, *trj_size).
+    os : float
+        The oversampling factor
+    opt_apods : Optional[bool]
+        If True, optimizes the apodization functions.
+        If False, uses the initial apodization functions.
+    epochs : Optional[int]
+        The number of epochs to train the model. Default is 100.
+        
+    Returns:
+    --------
+    weights : torch.Tensor
+        The learned kernel weights with shape (L, *kern_size, *trj_size).
+    apods : torch.Tensor
+        The learned apodization functions with shape (L, *im_size).
+    kern_model : nn.Module
+        The learned kernel model.
+    """
+    # Consts
+    torch_dev = phis.device
+    B = phis.shape[0]
+    L = apods_init.shape[0]
+    im_size = phis.shape[1:]
+    trj_size = alphas.shape[1:]
+    kern_size = kerns_init.shape[1:1+len(im_size)]
+    d = len(im_size)
+    
+    # Make kernel bases vectors
+    kern_vecs = gen_grd(kern_size, kern_size)
+    kern_vecs = kern_vecs.to(torch_dev).reshape((-1, d)) / os
+    
+    raise NotImplementedError('Gradient descent not implemented yet')
