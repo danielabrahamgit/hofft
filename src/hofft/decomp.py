@@ -173,6 +173,7 @@ def als_iterations(phase_model: matvec,
     spatial_factors : torch.Tensor
         spatial factors with shape (L, *im_size)
     """
+        
     # Default mask
     if mask is None:
         mask = torch.ones_like(spatial_factors_init[0])
@@ -216,7 +217,6 @@ def als_iterations(phase_model: matvec,
         # Update previous values
         kernel_weights_prev = kernel_weights
         spatial_factors_prev = spatial_factors
-        
         
     return kernel_weights, spatial_factors
     

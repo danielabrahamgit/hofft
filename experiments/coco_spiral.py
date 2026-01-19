@@ -26,6 +26,7 @@ from hofft.matvec import (
 R = 3
 fov = 0.22
 torch_dev = torch.device(6)
+torch.manual_seed(0)
 hparams = hofft_params(kern_size=(5,5),
                        os=1.5,
                        L=8,

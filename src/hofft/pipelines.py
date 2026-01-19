@@ -17,7 +17,7 @@ from .phase_coeffs import rescale_phis_alphas, trj_dev_to_phis_alphas, apply_pha
 from .sgd import train_net_apod
 from .kb import kb_apod_1d, sample_kb_kernel
 from .forward_model import hofft_linop
-
+from .reduce import expand_temporal, reduce_temporal, alpha_interp_kerns
 
 def kb_nufft(trj: torch.Tensor,
              im_size: tuple,
@@ -304,6 +304,18 @@ def als_hofft(trj: torch.Tensor,
     if trj_size_low is not None:
         alphas = spatial_resize_poly(alphas, trj_size_low, order=3)
     
+    # B = alphas.shape[0]
+    # dalphas = (0.3,)*B
+    dalphas = None
+    if dalphas is not None:
+        alphas_orig = alphas.clone()
+        W = 3
+        weights, delta_alphas = alpha_interp_kerns(phis, W=W, dalphas=dalphas)
+        alphas, alpha_kern, alpha_to_unq_idx = reduce_temporal(alphas, W=W, dalphas=dalphas)
+        alphas = alphas.T
+        print(alphas_orig.numel() // B, alphas.numel() // B)
+        print(alphas_orig.numel() / alphas.numel())
+    
     # Make matvec phase model
     phase_model = hparams.matvec_type(phis, alphas, **hparams.matvec_kwargs)
     
@@ -326,7 +338,13 @@ def als_hofft(trj: torch.Tensor,
     # temporal_crds = (gen_grd(trj_size).to(torch_dev) + 0.5) * solve_size_tensor
     # kern_weights_flt = kern_weights.reshape((-1, *kern_weights.shape[-len(trj_size):]))
     # kern_weights = spatial_interp(kern_weights_flt, temporal_crds, **kwargs)
-    kern_weights = kern_weights.reshape((L, *kern_size, *trj_size))
+    kern_weights = kern_weights.reshape((L, *kern_size, *alphas.shape[1:]))
+    
+    # Expand temporal
+    if dalphas is not None:
+        kern_weights = expand_temporal(kern_weights, alphas_orig, dalphas, weights, 
+                                       delta_alphas, alpha_kern, alpha_to_unq_idx,
+                                       temporal_batch_size=100)
     
     return kern_weights, spatial_factors
 
