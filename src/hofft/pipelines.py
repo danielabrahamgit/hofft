@@ -17,7 +17,7 @@ from .phase_coeffs import rescale_phis_alphas, trj_dev_to_phis_alphas, apply_pha
 from .sgd import train_net_apod
 from .kb import kb_apod_1d, sample_kb_kernel
 from .forward_model import hofft_linop
-from .reduce import expand_temporal, reduce_temporal, alpha_interp_kerns
+from .reduce import expand_temporal, reduce_temporal, alpha_interp_kerns, reduce_params, expand_spatial
 
 def kb_nufft(trj: torch.Tensor,
              im_size: tuple,
@@ -252,8 +252,7 @@ def als_hofft(trj: torch.Tensor,
               phis: torch.Tensor,
               alphas: torch.Tensor,
               hparams: hofft_params,
-              im_size_low: Optional[tuple] = None,
-              trj_size_low: Optional[tuple] = None,
+              rparams: Optional[reduce_params] = reduce_params(),
               num_als_iter: int = 100) -> tuple[torch.Tensor, torch.Tensor]:
     """
     General pipeline for getting a HOFFT linop using ALS.
@@ -261,15 +260,15 @@ def als_hofft(trj: torch.Tensor,
     Args
     ----
     trj : torch.Tensor
-        Trajectory of shape (*trj_size, d), where d = len(solve_size)
+        Trajectory of shape (*trj_size, d), where d = len(im_size)
     phis : torch.Tensor
         Spatial phase maps with shape (B, *im_size)
     alphas : torch.Tensor
         Temporal phase coefficients with shape (B, *trj_size)
-    solve_size : tuple
-        Optional low resolution size for performing the decomposition
     hparams : hofft_params
         HOFFT parameters.
+    rparams : Optional[reduce_params]
+        Parameters specifying how to reduce the spatial (phi) and temporal (alpha) dimensions
     num_als_iter : Optional[int]
         Number of ALS iterations.
         
@@ -281,7 +280,6 @@ def als_hofft(trj: torch.Tensor,
         Spatial factors with shape (L, *im_size)
     """
     # Consts
-    trj_size = alphas.shape[1:]
     im_size = phis.shape[1:]
     torch_dev = phis.device
     kern_size = hparams.kern_size
@@ -295,56 +293,73 @@ def als_hofft(trj: torch.Tensor,
     phis = torch.cat([phis, phis_dev], dim=0)
     alphas = torch.cat([alphas, alphas_dev], dim=0)
     
-    # Downsample if needed
-    if im_size_low is not None:
-        phis = spatial_resize_poly(phis, im_size_low, order=3)
-        kern_bases = build_kern_bases(kern_size, im_size_low, os).to(torch_dev)
+    # Reduce phi size
+    if rparams.spatial_reduce_size is not None:
+        phis_reduced = spatial_resize_poly(phis, 
+                                           im_size=rparams.spatial_reduce_size, 
+                                           order=rparams.spatial_reduce_order)
+        kern_bases = build_kern_bases(kern_size, 
+                                      im_size=rparams.spatial_reduce_size, 
+                                      os=os).to(torch_dev)
     else:
         kern_bases = build_kern_bases(kern_size, im_size, os).to(torch_dev)
-    if trj_size_low is not None:
-        alphas = spatial_resize_poly(alphas, trj_size_low, order=3)
+        phis_reduced = phis
     
-    # B = alphas.shape[0]
-    # dalphas = (0.3,)*B
-    dalphas = None
-    if dalphas is not None:
-        alphas_orig = alphas.clone()
-        W = 3
-        weights, delta_alphas = alpha_interp_kerns(phis, W=W, dalphas=dalphas)
-        alphas, alpha_kern, alpha_to_unq_idx = reduce_temporal(alphas, W=W, dalphas=dalphas)
-        alphas = alphas.T
-        print(alphas_orig.numel() // B, alphas.numel() // B)
-        print(alphas_orig.numel() / alphas.numel())
+    # Reduce alpha size
+    if rparams.alpha_reduce_width is not None:
+        ret = alpha_interp_kerns(phis_reduced, 
+                                 W=rparams.alpha_reduce_width, 
+                                 dalphas=rparams.alpha_reduce_grid_spacing, 
+                                 solve_apod=rparams.alpha_reduce_use_apod)
+        weights, delta_alphas, apods = ret
+        ret = reduce_temporal(alphas, 
+                              W=rparams.alpha_reduce_width, 
+                              dalphas=rparams.alpha_reduce_grid_spacing)
+        alphas_reduced, alpha_kern, alpha_to_unq_idx = ret
+        alphas_reduced = alphas_reduced.T
+        print(alphas.numel() / alphas_reduced.numel())
+    else:
+        alphas_reduced = alphas
     
     # Make matvec phase model
-    phase_model = hparams.matvec_type(phis, alphas, **hparams.matvec_kwargs)
+    phase_model = hparams.matvec_type(phis_reduced, alphas_reduced, 
+                                      **hparams.matvec_kwargs)
     
     # Initialize spatial factors
-    spatial_factors = choose_init(phis, alphas, hparams, 
+    spatial_factors = choose_init(phis_reduced, alphas_reduced, 
+                                  hparams=hparams, 
                                   spatial_init=spatial_init)
 
     # ALS to solve for kernel weights and spatial factors
-    kern_weights, spatial_factors = als_iterations(phase_model, kern_bases, spatial_factors, max_iter=num_als_iter, verbose=verbose)
+    kern_weights, spatial_factors = als_iterations(phase_model, kern_bases,
+                                                   spatial_factors_init=spatial_factors,
+                                                   max_iter=num_als_iter, 
+                                                   verbose=verbose)
+    kern_weights = kern_weights.reshape((L, *kern_size, *alphas_reduced.shape[1:]))
 
-    # Interpolate spatial funcs
-    kwargs = {'order': 3, 'mode': 'nearest'}
-    solve_size_tensor = torch.tensor(phis.shape[1:]).to(torch_dev)
-    spatial_crds = (gen_grd(im_size).to(torch_dev) + 0.5) * solve_size_tensor
-    spatial_factors = spatial_interp(spatial_factors, spatial_crds, **kwargs)
+    # Expand phis 
+    if rparams.spatial_reduce_size is not None:
+        # kwargs = {'order': 3, 'mode': 'nearest'}
+        # reduced_size_tensor = torch.tensor(rparams.spatial_reduce_size).to(torch_dev)
+        # spatial_crds = (gen_grd(im_size).to(torch_dev) + 0.5) * reduced_size_tensor
+        # spatial_factors = spatial_interp(spatial_factors, spatial_crds, **kwargs)
+        spatial_factors = expand_spatial(spatial_factors, 
+                                         im_size_high=im_size,
+                                         order=rparams.spatial_reduce_order)
     
-    # # Interpolate temporal funcs
-    # kwargs = {'order': 3, 'mode': 'nearest'}
-    # solve_size_tensor = torch.tensor(alphas.shape[1:]).to(torch_dev)
-    # temporal_crds = (gen_grd(trj_size).to(torch_dev) + 0.5) * solve_size_tensor
-    # kern_weights_flt = kern_weights.reshape((-1, *kern_weights.shape[-len(trj_size):]))
-    # kern_weights = spatial_interp(kern_weights_flt, temporal_crds, **kwargs)
-    kern_weights = kern_weights.reshape((L, *kern_size, *alphas.shape[1:]))
-    
-    # Expand temporal
-    if dalphas is not None:
-        kern_weights = expand_temporal(kern_weights, alphas_orig, dalphas, weights, 
-                                       delta_alphas, alpha_kern, alpha_to_unq_idx,
-                                       temporal_batch_size=100)
+    # Expand alphas
+    if rparams.alpha_reduce_width is not None:
+        kern_weights = expand_temporal(kern_weights, alphas, 
+                                       dalphas=rparams.alpha_reduce_grid_spacing,
+                                       weights=weights,
+                                       delta_alphas=delta_alphas,
+                                       alpha_kern=alpha_kern,
+                                       alpha_to_unq_idx=alpha_to_unq_idx,
+                                       temporal_batch_size=rparams.alpha_interp_batch_size)
+        apods = expand_spatial(apods,
+                               im_size_high=im_size,
+                               order=rparams.spatial_reduce_order)
+        spatial_factors *= apods.prod(dim=0)
     
     return kern_weights, spatial_factors
 

@@ -35,6 +35,7 @@ class hofft_params:
     kern_size: tuple
     os: float
     L: int
+    reduced_im_size: Optional[tuple] = None
     matvec_type: matvec = matvec_naive
     matvec_kwargs: dict = field(default_factory=dict)
     spatial_init: Union[torch.Tensor, str] = 'seg'
@@ -50,6 +51,8 @@ class hofft_params:
         Oversampling factor.
     L : Optional[int]
         Number of apodization functions.
+    reduced_im_size: Optional[tuple]
+        Optional low resolution size for performing the decomposition
     matvec : matvec
         Matrix-vector operation for the HOFFT model, must be a subclass of matvec. Options are:
         'matvec_naive' - naive implementation of the matrix-vector product (default)

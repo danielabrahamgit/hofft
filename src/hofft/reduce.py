@@ -4,11 +4,41 @@ Contains tools for reducing the spatial or temporal dimension sizes.
 
 import torch
 
-from mr_recon.spatial import spatial_resize_poly
+from mr_recon.spatial import spatial_resize_poly, spatial_interp
+from mr_recon.utils import gen_grd
+from typing import Optional, Callable, Union
+from dataclasses import dataclass
 from math import floor, ceil
-from typing import Optional, Callable
+from einops import einsum
 from tqdm import tqdm
 
+@dataclass
+class reduce_params: 
+    spatial_reduce_size: Optional[tuple] = None
+    spatial_reduce_order: int = 3
+    alpha_reduce_width: Optional[int] = None
+    alpha_reduce_grid_spacing: Union[float, tuple] = 0.5
+    alpha_reduce_use_apod: bool = False
+    alpha_interp_batch_size: Optional[int] = None
+    """
+    Parameters for reducing the spatial or temporal dimension sizes.
+    
+    Attributes
+    ----------
+    spatial_reduce_size : Optional[tuple]
+        Optional low resolution size for performing the decomposition
+    spatial_reduce_order : int
+        Order of the polynomial interpolation
+    alpha_reduce_width : Optional[int]
+        Width of the kernel
+    alpha_reduce_grid_spacing : Union[float, tuple]
+        Step sizes for the alpha deviations for each alpha direction, len(alpha_reduce_grid_spacing) = B
+    alpha_reduce_use_apod : bool
+        Whether to solve for the apodization function
+    alpha_interp_batch_size : Optional[int]
+        Batch size for the temporal dimension
+    """
+    
 def reduce_spatial(spatial_data: torch.Tensor, 
                    im_size_low: tuple, 
                    order: int = 3) -> torch.Tensor:
@@ -56,17 +86,31 @@ def expand_spatial(spatial_data: torch.Tensor,
     spatial_data_high : torch.Tensor
         Expanded spatial data with shape (..., *im_size_high)
     """
-    return spatial_resize_poly(spatial_data, 
-                               im_size=im_size_high, 
-                               order=order, 
-                               mode='nearest')
+    # return spatial_resize_poly(spatial_data, 
+    #                            im_size=im_size_high, 
+    #                            order=order, 
+    #                            mode='nearest')
+    
+    kwargs = {'order': order, 'mode': 'nearest'}
+    torch_dev = spatial_data.device
+    im_size_low = spatial_data.shape[-len(im_size_high):]
+    im_size_low_tensor = torch.tensor(im_size_low).to(torch_dev)
+    spatial_crds = (gen_grd(im_size_high).to(torch_dev) + 0.5) * im_size_low_tensor
+    spatial_data_high = spatial_interp(spatial_data, spatial_crds, **kwargs)
+    return spatial_data_high
 
-def solve_1d_kern(phi: torch.Tensor,
-                  W: int = 2,
-                  dalpha: float = 0.1,
-                  Nkerns: int = 100) -> torch.Tensor:
-    """
+def _solve_1d_kern(phi: torch.Tensor,
+                   W: int = 2,
+                   dalpha: float = 0.5,
+                   Nkerns: int = 100,
+                   ptol: float = 1e-4,
+                   solve_apod: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    f"""
     Solves for 1d interpolation weights for interpolating in an alpha direction.
+    
+    Equation to solve is
+    e^(-j 2pi delta_alpha * phi(r)) = sum_l w_l(delta_alpha) e^(-j 2pi alpha_l * phi) * A(phi)
+    where A(phi) is an optional apodization function.
     
     Args
     ----
@@ -78,6 +122,10 @@ def solve_1d_kern(phi: torch.Tensor,
         Step size for the alpha deviations
     Nkerns : int
         Number of kernel weights to solve for
+    ptol : float
+        Percent tolerance for ALS convergence
+    solve_apod : bool
+        Whether to solve for the apodization function
         
     Returns
     -------
@@ -85,6 +133,8 @@ def solve_1d_kern(phi: torch.Tensor,
         Kernel weights with shape (Nkerns,)
     delta_alphas : torch.Tensor
         Delta alphas with shape (Nkerns,)
+    apod : torch.Tensor
+        Apodization function with shape (R,)
     """
     # Consts
     phi_flt = phi.flatten()
@@ -97,19 +147,60 @@ def solve_1d_kern(phi: torch.Tensor,
     # Alpha deviations
     delta_alphas = torch.linspace(-dalpha/2, dalpha/2, Nkerns, device=torch_dev)
     
+    # Apodization function
+    apod = torch.ones(len(phi_flt), device=torch_dev, dtype=torch.complex64)
+    
     # Setup least squares to get kernel weights
-    A = torch.exp(-2j * torch.pi * alphas_grd[None, :] * phi_flt[:, None]) # R W
-    B = torch.exp(-2j * torch.pi * delta_alphas[None, :] * phi_flt[:, None]) # R Nkerns
+    def _solve_kern_weights(apod: torch.Tensor) -> torch.Tensor:
+        # Build matrices
+        A = torch.exp(-2j * torch.pi * alphas_grd[None, :] * phi_flt[:, None]) * apod[:, None] # R W
+        B = torch.exp(-2j * torch.pi * delta_alphas[None, :] * phi_flt[:, None]) # R Nkerns
+        
+        # Solve least squares
+        weights = torch.linalg.solve(A.H @ A, A.H @ B).T # Nkerns W
+        return weights
     
-    # Solve least squares
-    weights = torch.linalg.solve(A.H @ A, A.H @ B).T # Nkerns W
+    # Setup least squares to get apodization function
+    def _solve_apod(weights: torch.Tensor) -> torch.Tensor:
+        # Build matrices
+        A = torch.exp(-2j * torch.pi * alphas_grd[None, :] * phi_flt[:, None]) # R W
+        Aw = einsum(A, weights, 'R W, N W -> R N')
+        B = torch.exp(-2j * torch.pi * delta_alphas[None, :] * phi_flt[:, None]) # R Nkerns
+        
+        # Solve least squares
+        AHA = (Aw.conj() * Aw).sum(dim=-1)
+        AHB = (Aw.conj() * B).sum(dim=-1)
+        apod = AHB / AHA
+        
+        return apod
     
-    return weights, delta_alphas
+    if solve_apod:
+        for i in tqdm(range(1000), 'Mini ALS for apodization'):
+            # ALS
+            weights = _solve_kern_weights(apod)
+            apod = _solve_apod(weights)
+            
+            # Check convergence
+            if i > 0:
+                potl_apod = (apod - apod_prev).norm() / apod_prev.norm()
+                potl_weights = (weights - weights_prev).norm() / weights_prev.norm()
+                if potl_apod < ptol and potl_weights < ptol:
+                    break
+                
+            # Update previous values
+            apod_prev = apod.clone()
+            weights_prev = weights.clone()
+    else:
+        # Solve for kernel weights
+        weights = _solve_kern_weights(apod)
+    
+    return weights, delta_alphas, apod
 
 def alpha_interp_kerns(phis: torch.Tensor,
                        W: int = 2,
-                       dalphas: Optional[tuple] = None,
-                       Nkerns: int = 100) -> torch.Tensor:
+                       dalphas: Union[float, tuple] = 0.5,
+                       Nkerns: int = 100,
+                       solve_apod: bool = False) -> torch.Tensor:
     """
     Solves for 1d interpolation weights for interpolating in an alpha direction.
     
@@ -123,6 +214,8 @@ def alpha_interp_kerns(phis: torch.Tensor,
         Step sizes for the alpha deviations for each alpha direction, len(dalphas) = B
     Nkerns : int
         Number of kernel weights to solve for
+    solve_apod : bool
+        Whether to solve for the apodization function
         
     Returns
     -------
@@ -134,22 +227,28 @@ def alpha_interp_kerns(phis: torch.Tensor,
     # Consts
     B = phis.shape[0]
     phis_flt = phis.reshape((B, -1))
-    if dalphas is None:
-        dalphas = (0.1,) * B
+    if isinstance(dalphas, float):
+        dalphas = (dalphas,) * B
+    elif isinstance(dalphas, tuple):
+        assert len(dalphas) == B, "dalphas must be a tuple of length B"
     
     # Solve for kernel weights
     weights = []
     delta_alphas = []
+    apods = []
     for b in range(B):
-        weight, delta_alpha = solve_1d_kern(phis_flt[b], W, dalphas[b], Nkerns)
+        weight, delta_alpha, apod = _solve_1d_kern(phis_flt[b], W, dalphas[b], Nkerns, solve_apod=solve_apod)
         weights.append(weight)
         delta_alphas.append(delta_alpha)
+        apods.append(apod)
         
     # Stack
     weights = torch.stack(weights, dim=0)
     delta_alphas = torch.stack(delta_alphas, dim=0)
+    apods = torch.stack(apods, dim=0)
+    apods = apods.reshape((B, *phis.shape[1:]))
     
-    return weights, delta_alphas
+    return weights, delta_alphas, apods
 
 def reduce_temporal(alphas: torch.Tensor,
                     W: int = 2,
@@ -178,8 +277,10 @@ def reduce_temporal(alphas: torch.Tensor,
     """
     # Consts
     B = alphas.shape[0]
-    if dalphas is None:
-        dalphas = (0.1,) * B
+    if isinstance(dalphas, float):
+        dalphas = (dalphas,) * B
+    elif isinstance(dalphas, tuple):
+        assert len(dalphas) == B, "dalphas must be a tuple of length B"
         
     # Build kernel
     alpha_kern = torch.arange(-floor(W/2), ceil(W/2), device=alphas.device, dtype=torch.float32)
@@ -277,7 +378,7 @@ def expand_temporal(lowres_data: torch.Tensor,
     
     # Interpolate
     data_out = torch.zeros((len(lowres_data_flt),) + (len(alphas_flt),) , device=torch_dev, dtype=lowres_data.dtype)
-    for t1 in tqdm(range(0, len(alphas_flt), temporal_batch_size), 'Expanding temporal'):
+    for t1 in tqdm(range(0, len(alphas_flt), temporal_batch_size), 'Alpha interpolation'):
         
         # Batch of temporal stuff
         t2 = min(t1 + temporal_batch_size, len(alphas_flt))
@@ -296,9 +397,4 @@ def expand_temporal(lowres_data: torch.Tensor,
     # Reshape output
     data_out = data_out.reshape(arb_size + trj_size)
     return data_out
-        
-        
-        
-    
-    
-        
+                

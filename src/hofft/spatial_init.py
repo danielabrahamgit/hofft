@@ -17,8 +17,7 @@ def choose_init(phis: torch.Tensor,
                 alphas: torch.Tensor,
                 hparams: hofft_params,
                 spatial_init: Union[str, torch.Tensor] = '100_alphas',
-                k_alphas_method: str = 'minmax',
-                num_als_iter: int = 100,) -> torch.Tensor:
+                k_alphas_method: str = 'minmax') -> torch.Tensor:
     
     # Initialize spatial factors
     if isinstance(spatial_init, torch.Tensor):
@@ -28,9 +27,14 @@ def choose_init(phis: torch.Tensor,
             spatial_factors = eigen_init(phis, alphas, hparams)
         elif spatial_init == 'seg':
             spatial_factors = alpha_seg_init(phis, alphas, hparams)
-        elif re.fullmatch(r"\d+_alphas", spatial_init):
-            K = int(spatial_init.split('_')[0])
-            # TODO number of iteratioins as string input?
+        elif 'alphas' in spatial_init:
+            splt = spatial_init.split('_')
+            if len(splt) == 2:
+                K = int(splt[0])
+                num_als_iter = 100
+            elif len(splt) == 3:
+                K = int(splt[0])
+                num_als_iter = int(splt[2])
             spatial_factors = K_alphas_init(phis, alphas, hparams,
                                            method=k_alphas_method,
                                            spatial_init_method='seg',
