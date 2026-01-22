@@ -288,11 +288,6 @@ def als_hofft(trj: torch.Tensor,
     spatial_init = hparams.spatial_init
     verbose = hparams.verbose
     
-    # Grab deviation term from k-space trajectory
-    phis_dev, alphas_dev = trj_dev_to_phis_alphas(trj, im_size, os)
-    phis = torch.cat([phis, phis_dev], dim=0)
-    alphas = torch.cat([alphas, alphas_dev], dim=0)
-    
     # Reduce phi size
     if rparams.spatial_reduce_size is not None:
         phis_reduced = spatial_resize_poly(phis, 

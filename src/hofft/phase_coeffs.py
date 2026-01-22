@@ -307,6 +307,63 @@ def rescale_phis_alphas(phis: torch.Tensor,
     alphas_nrm = alphas_flt_cent.reshape((B, *trj_size))
     return phis_nrm, phis_mp, alphas_nrm, alphas_mp
 
+def compress_phis_alphas(phis: torch.Tensor,
+                         alphas: torch.Tensor,
+                         B_compressed: int = 5,) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compress the number of bases in the phase model using SVD.
+    This method was developed by ChatGPT :) 
+    
+    Args
+    ----
+    phis : torch.Tensor
+        The spatial phase bases, shape (B, *im_size)
+    alphas : torch.Tensor
+        The temporal phase coefficients, shape (B, *trj_size)
+    B_compressed : int
+        The number of compressed bases to  compress to
+        
+    Returns
+    -------
+    phis_compressed : torch.Tensor
+        The compressed spatial phase bases, shape (B_compressed, *im_size)
+    alphas_compressed : torch.Tensor
+        The compressed temporal phase coefficients, shape (B_compressed, *trj_size)
+    """
+    # Consts
+    B = phis.shape[0]
+    R = np.prod(phis.shape[1:])
+    T = np.prod(alphas.shape[1:])
+    im_size = phis.shape[1:]
+    trj_size = alphas.shape[1:]
+    assert B == alphas.shape[0]
+    assert B_compressed <= B, "B_compressed must be less than or equal to B"
+    
+    # Flatten everything
+    P = phis.reshape((B, R)).T
+    A = alphas.reshape((B, T))
+    
+    # Small BxB Gram matrices
+    H = A @ A.H # B B
+    G = P.H @ P # B B
+    
+    # Cholesky and Solve orthogonal basis
+    L = torch.linalg.cholesky(G)
+    # Q = P @ torch.linalg.inv(L).H
+    Q = torch.linalg.solve(L.H, P, left=False)
+    
+    # Decompose and form new SVD terms
+    K = L.H @ H @ L # B B
+    U, S, _ = torch.linalg.svd(K, full_matrices=False) # B B
+    U = Q @ U # B R
+    S = S ** 0.5 # B
+    V = A.H @ P.H @ U @ torch.diag(S ** -1) # B T
+    
+    # Reshape and return
+    phis_compressed   = (U[:, :B_compressed] * (S[:B_compressed] ** 0.5)).T.reshape((B_compressed, *im_size))
+    alphas_compressed = (V[:, :B_compressed] * (S[:B_compressed] ** 0.5)).T.reshape((B_compressed, *trj_size))
+    return phis_compressed, alphas_compressed
+
 def apply_phase_midpoints(phis_nrm: torch.Tensor,
                           alphas_nrm: torch.Tensor,
                           phis_mp: torch.Tensor,

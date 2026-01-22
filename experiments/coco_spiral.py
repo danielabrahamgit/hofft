@@ -15,7 +15,9 @@ from hofft.phase_coeffs import (
   coco_to_phis_alphas, 
   b0_to_phis_alphas, 
   rescale_phis_alphas, 
-  apply_phase_midpoints
+  apply_phase_midpoints,
+  trj_dev_to_phis_alphas,
+  compress_phis_alphas,
 )
 
 # Params
@@ -62,9 +64,15 @@ idxs = [0, 1] # only two of the coco terms are actually relevant for a x-z plane
 phis_coco = phis_coco[idxs]
 alphas_coco = alphas_coco[idxs]
 
+# Phase coefficients from trajectory deviation
+phis_dev, alphas_dev = trj_dev_to_phis_alphas(trj, im_size, hparams.os)
+
 # Stack phase coefficients and normalize
-phis = torch.cat([phis_b0, phis_coco], dim=0)
-alphas = torch.cat([alphas_b0, alphas_coco], dim=0)
+phis = torch.cat([phis_b0, phis_coco, phis_dev], dim=0)
+alphas = torch.cat([alphas_b0, alphas_coco, alphas_dev], dim=0)
+
+# SVD and rescale phase coefficients
+phis, alphas = compress_phis_alphas(phis, alphas, B_compressed=4)
 phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis, alphas)
 
 # Perform high order phase decomposition
@@ -88,7 +96,7 @@ img_recon = CG_SENSE_recon(A, ksp, max_iter=10, max_eigen=1.0).cpu()
 # A = encoding_matrix(mps, phis, alphas, dcf, temporal_batch_size=2**10)
 # img_gt = CG_SENSE_recon(A, ksp, max_iter=10, max_eigen=1.0)
 # torch.save(img_gt.cpu(), f'./coco_spiral_expanded_encoding_recon.pt')
-img_gt = torch.load(f'./coco_spiral_expanded_encoding_recon.pt', weights_only=True)
+img_gt = torch.load(f'./experiments/coco_spiral_expanded_encoding_recon.pt', weights_only=True)
 
 # Normalize data
 img_recon = normalize(img_recon, img_gt, mag=True, ofs=False)
