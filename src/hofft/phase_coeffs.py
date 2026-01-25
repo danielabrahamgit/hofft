@@ -355,10 +355,11 @@ def compress_phis_alphas(phis: torch.Tensor,
     # Decompose and form new SVD terms
     K = L.H @ H @ L # B B
     U, S, _ = torch.linalg.svd(K, full_matrices=False) # B B
+    # S, U = torch.linalg.eigh(K)
     U = Q @ U # B R
     S = S ** 0.5 # B
     V = A.H @ P.H @ U @ torch.diag(S ** -1) # B T
-    
+
     # Reshape and return
     phis_compressed   = (U[:, :B_compressed] * (S[:B_compressed] ** 0.5)).T.reshape((B_compressed, *im_size))
     alphas_compressed = (V[:, :B_compressed] * (S[:B_compressed] ** 0.5)).T.reshape((B_compressed, *trj_size))

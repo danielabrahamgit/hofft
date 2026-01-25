@@ -25,14 +25,16 @@ R = 3
 fov = 0.22
 torch_dev = torch.device(6)
 torch.manual_seed(0)
-num_als_iter = 10
+num_als_iter = 10*0
 hparams = hofft_params(kern_size=(5,5),
                        os=1.5,
-                       L=6*2,)
-rparams = reduce_params(alpha_reduce_width=2,
+                       L=6*2,
+                       spatial_init='100_alphas_10'
+                       )
+rparams = reduce_params(alpha_reduce_use_apod=True,
+                        # alpha_reduce_width=2,
                         spatial_reduce_size=(120,120),
-                        alpha_reduce_grid_spacing=0.3,
-                        alpha_reduce_use_apod=True,
+                        alpha_reduce_grid_spacing=0.5,
                         alpha_interp_batch_size=2**10)
 
 # Load data

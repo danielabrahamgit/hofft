@@ -323,7 +323,8 @@ def als_hofft(trj: torch.Tensor,
     # Initialize spatial factors
     spatial_factors = choose_init(phis_reduced, alphas_reduced, 
                                   hparams=hparams, 
-                                  spatial_init=spatial_init)
+                                  spatial_init=spatial_init,
+                                  k_alphas_method='minmax')
 
     # ALS to solve for kernel weights and spatial factors
     kern_weights, spatial_factors = als_iterations(phase_model, kern_bases,
@@ -334,10 +335,6 @@ def als_hofft(trj: torch.Tensor,
 
     # Expand phis 
     if rparams.spatial_reduce_size is not None:
-        # kwargs = {'order': 3, 'mode': 'nearest'}
-        # reduced_size_tensor = torch.tensor(rparams.spatial_reduce_size).to(torch_dev)
-        # spatial_crds = (gen_grd(im_size).to(torch_dev) + 0.5) * reduced_size_tensor
-        # spatial_factors = spatial_interp(spatial_factors, spatial_crds, **kwargs)
         spatial_factors = expand_spatial(spatial_factors, 
                                          im_size_high=im_size,
                                          order=rparams.spatial_reduce_order)
