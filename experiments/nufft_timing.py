@@ -505,11 +505,11 @@ class nufft(nn.Module):
 torch_dev = torch.device(5)
 im_size = (220,)*3
 os = 1.2
-width = 1
+width = 3
 nrep = 100
 
 # Create kooshball trajectory
-Nspokes = 10_000
+Nspokes = 500 * 32
 Nread = im_size[0] * 2
 phis = torch.arccos(2 * torch.rand(Nspokes, device=torch_dev) - 1)
 thetas = torch.rand(Nspokes, device=torch_dev) * torch.pi * 2
@@ -518,8 +518,9 @@ vecs = torch.stack([torch.cos(thetas) * torch.sin(phis),
                     torch.cos(phis)], dim=-1)
 rs = torch.linspace(-1, 1, Nread, device=torch_dev)
 trj = vecs[None, :, :] * rs[:, None, None]
+trj = trj[..., :len(im_size)]
 
-# Make delta function image
+# Make delta function imagegit
 img = torch.zeros(im_size, device=torch_dev, dtype=torch.complex64)
 img[tuple(im_size[i]//2 for i in range(len(im_size)))] = 1
 
@@ -531,11 +532,28 @@ for _ in tqdm(range(nrep), 'Sigpy NUFFT'):
     y = nft.forward(img[None,], trj[None,])[0]
     img_nufft = nft.adjoint(y[None,], trj[None,])[0]
 
-# Apply NUFFT and adjoint
-nft = nufft(im_size, os, width, kern_type='kb')
-nft.param = nft.opt_param(torch_dev)
-nft.plan(trj)
-for _ in tqdm(range(nrep), 'My NUFFT'):
-    y = nft.forward(img[None,], trj)[0]
-    img_nufft = nft.adjoint(y[None,], trj)[0]
+from hofft.pipelines import als_nufft
+from hofft.decomp import hofft_params
+from hofft.forward_model import hofft_linop
+hparams = hofft_params(kern_size=(width,)*len(im_size), os=os, L=1)
+# hparams = hofft_params(kern_size=(1,)*len(im_size), os=os, L=round(0.2 * width**len(im_size)))
+kern_weights, spatial_factor = als_nufft(trj, im_size, hparams,
+                                         im_size_low=(50,)*len(im_size),
+                                         num_als_iter=10)
+trj_grd = (trj * os).round() / os
+hft = hofft_linop(trj_grd, img[None,]*0+1, kern_weights, spatial_factor,
+                  os_grid=os)
+for _ in tqdm(range(nrep), 'HOFFT NUFFT'):
+    y = hft(img)
+    img_nufft = hft.adjoint(y)
+
+# # Apply NUFFT and adjoint
+# from mr_recon.fourier import mr_recon_nufft
+# # nft = nufft(im_size, os, width, kern_type='kb')
+# nft = mr_recon_nufft(im_size, os, width)
+# nft.param = nft.opt_param(torch_dev)
+# nft.plan(trj)
+# for _ in tqdm(range(nrep), 'My NUFFT'):
+#     y = nft.forward(img[None,], trj)[0]
+#     img_nufft = nft.adjoint(y[None,], trj)[0]
 

@@ -30,8 +30,6 @@ class matvec(torch.nn.Module):
                  alphas: torch.Tensor,
                  spatial_batch_size: Optional[int] = None,
                  temporal_batch_size: Optional[int] = None,
-                #  spatial_weights: Optional[torch.Tensor] = None,
-                #  temporal_weights: Optional[torch.Tensor] = None,
                 ):
         """
         Args
@@ -60,16 +58,6 @@ class matvec(torch.nn.Module):
         self.T = np.prod(self.trj_size)
         self.B = self.phis.shape[0]
         assert self.B == self.alphas.shape[0], 'Number of spatial and temporal phase maps must match.'
-        
-        # # Spatial and temporal weights
-        # if spatial_weights is None:
-        #     self.spatial_weights = torch.ones(self.im_size, dtype=self.phis.dtype, device=self.phis.device)
-        # else:
-        #     self.spatial_weights = spatial_weights
-        # if temporal_weights is None:
-        #     self.temporal_weights = torch.ones(self.trj_size, dtype=self.alphas.dtype, device=self.alphas.device)
-        # else:
-        #     self.temporal_weights = temporal_weights
         
         # Batch sizes
         if spatial_batch_size is None:
@@ -160,8 +148,6 @@ class matvec_naive(matvec):
         B = phis.shape[0]
         self.phis = self.phis.reshape((B, -1))
         self.alphas = self.alphas.reshape((B, -1))
-        
-        
         
     def forward(self,
                 x: torch.Tensor) -> torch.Tensor:

@@ -5,7 +5,8 @@ import matplotlib.pyplot as plt
 
 from mr_recon.recons import CG_SENSE_recon
 from mr_recon.utils import gen_grd, normalize
-from mr_recon.linops import batching_params, encoding_matrix
+from mr_recon.linops import batching_params, encoding_matrix, sense_linop
+from mr_recon.fourier import sigpy_nufft
 
 from hofft.pipelines import als_hofft
 from hofft.decomp import hofft_params
@@ -23,22 +24,26 @@ from hofft.phase_coeffs import (
 # Params
 R = 3
 fov = 0.22
-torch_dev = torch.device(6)
+torch_dev = torch.device(4)
 torch.manual_seed(0)
-num_als_iter = 10*0
-hparams = hofft_params(kern_size=(5,5),
-                       os=1.5,
-                       L=6*2,
-                       spatial_init='100_alphas_10'
+num_als_iter = 100*0
+hparams = hofft_params(kern_size=(6,)*2,
+                       os=1.25,
+                       L=5,
+                       spatial_init='100_alphas_10',
+                      #  anderson_order=10,
+                      #  spatial_init='seg',
+                      #  spatial_init='ones',
+                      #  spatial_init='eigen',
                        )
 rparams = reduce_params(alpha_reduce_use_apod=True,
                         # alpha_reduce_width=2,
                         spatial_reduce_size=(120,120),
-                        alpha_reduce_grid_spacing=0.5,
+                        alpha_reduce_grid_spacing=0.12,
                         alpha_interp_batch_size=2**10)
 
 # Load data
-fpath = '/local_mount/space/tiger/1/users/abrahamd/hofft/data/coco_spiral'
+fpath = '/local_mount/space/mayday/data/users/abrahamd/hofft/data/coco_spiral'
 b0 = torch.load(f'{fpath}/b0.pt', map_location=torch_dev)
 mps = torch.load(f'{fpath}/mps.pt', map_location=torch_dev)
 trj = torch.load(f'{fpath}/trj.pt', map_location=torch_dev)
@@ -46,7 +51,11 @@ dcf = torch.load(f'{fpath}/dcf.pt', map_location=torch_dev)
 ksp = torch.load(f'{fpath}/ksp.pt', map_location=torch_dev)
 img_gt = torch.load(f'{fpath}/img_gt.pt', map_location=torch_dev)
 im_size = b0.shape
+trj_size = trj.shape[:-1]
 C = mps.shape[0]
+print(f'img size: {im_size}')
+print(f'trj Size: {trj_size}')
+hparams.os = 2 * round(hparams.os * im_size[0] / 2) / im_size[0] # makes sure we get an even integer
 
 # Undersample data and typecast
 trj = trj[..., ::R, :].type(torch.float32)
@@ -70,22 +79,34 @@ alphas_coco = alphas_coco[idxs]
 phis_dev, alphas_dev = trj_dev_to_phis_alphas(trj, im_size, hparams.os)
 
 # Stack phase coefficients and normalize
-phis = torch.cat([phis_b0, phis_coco, phis_dev], dim=0)
-alphas = torch.cat([alphas_b0, alphas_coco, alphas_dev], dim=0)
+if hparams.kern_size == (1,)*2:
+  phis = torch.cat([phis_b0, phis_coco], dim=0)
+  alphas = torch.cat([alphas_b0, alphas_coco], dim=0)
+else:  
+  phis = torch.cat([phis_b0, phis_coco, phis_dev], dim=0)
+  alphas = torch.cat([alphas_b0, alphas_coco, alphas_dev], dim=0)
 
 # SVD and rescale phase coefficients
-phis, alphas = compress_phis_alphas(phis, alphas, B_compressed=4)
+# phis, alphas = compress_phis_alphas(phis, alphas, B_compressed=5)
 phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis, alphas)
 
 # Perform high order phase decomposition
-kern_weights, spatial_factors = als_hofft(trj, phis_nrm, alphas_nrm, hparams, rparams,
+spatial_factors, kern_weights = als_hofft(phis_nrm, alphas_nrm, hparams, rparams,
                                           num_als_iter=num_als_iter)
-kern_weights, spatial_factors = apply_phase_midpoints(phis_nrm, alphas_nrm, phis_mp, alphas_mp, kern_weights, spatial_factors)
+spatial_factors, kern_weights = apply_phase_midpoints(phis_nrm, alphas_nrm, phis_mp, alphas_mp, spatial_factors, kern_weights)
 
 # Build linear operator
 bparams = batching_params(C*0+1)
-trj_grd = (hparams.os * trj).round()/hparams.os
-A = hofft_linop(trj_grd, mps, kern_weights, spatial_factors, dcf, os_grid=hparams.os, bparams=bparams)
+if hparams.kern_size == (1,)*2:
+  nufft = sigpy_nufft(im_size, oversamp=1.25, width=4)
+  A = sense_linop(trj, mps, dcf, 
+                  nufft=nufft,
+                  spatial_funcs=spatial_factors,
+                  temporal_funcs=kern_weights[:, 0, 0, ...],
+                  bparams=bparams)
+else:
+  trj_grd = (hparams.os * trj).round()/hparams.os
+  A = hofft_linop(trj_grd, mps, kern_weights, spatial_factors, dcf, os_grid=hparams.os, bparams=bparams)
 
 # Recon
 img_recon = CG_SENSE_recon(A, ksp, max_iter=10, max_eigen=1.0).cpu()

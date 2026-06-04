@@ -1,66 +1,106 @@
 import torch 
+import numpy as np
 
 import matplotlib as mpl
 mpl.use('Webagg')
 import matplotlib.pyplot as plt
 
-from mr_recon.algs import density_compensation
-from mr_recon.fourier import sigpy_nufft
-from mr_recon.utils import gen_grd, np_to_torch
+from mr_recon.utils import normalize, gen_grd
+from mr_recon.fourier import sigpy_nufft, mr_recon_nufft, matrix_nufft
 from mr_recon.linops import batching_params, sense_linop
 from mr_recon.recons import CG_SENSE_recon
 
-from hofft.pipelines import als_nufft, kb_nufft
+from hofft.pipelines import als_nufft, als_hofft
 from hofft.decomp import hofft_params
 from hofft.forward_model import hofft_linop
+from hofft.reduce import reduce_params
+from hofft.phase_coeffs import rescale_phis_alphas, apply_phase_midpoints
 
-# Parameters\
-kern_size = (3, 3)
-os = 1.2
-torch_dev = torch.device(1)
+# Parameters
+torch_dev = torch.device(5)
+max_iter = 100
+kern_size = (3,)*2
+os = 1.3
 
 # Load the data
-fpath = '/local_mount/space/tiger/1/users/abrahamd/hofft/data/sim_spiral'
-img = torch.load(f'{fpath}/img.pt', map_location=torch_dev)
+fpath = '/local_mount/space/mayday/data/users/abrahamd/hofft/data/sim_spiral'
+evals = torch.load(f'{fpath}/evals.pt', map_location=torch_dev)
 mps = torch.load(f'{fpath}/mps.pt', map_location=torch_dev)
+img = torch.load(f'{fpath}/img.pt', map_location=torch_dev)
 trj = torch.load(f'{fpath}/trj.pt', map_location=torch_dev)
 dcf = torch.load(f'{fpath}/dcf.pt', map_location=torch_dev)
 im_size = img.shape
 C = mps.shape[0]
 
+# Mask
+spatial_mask = 1.0 * (evals > 0.95)
+mps = mps * spatial_mask
+
 # Compare with ground truth
 kwargs = {'bparams': batching_params(coil_batch_size=C), 'use_toeplitz': False}
 nufft_gt = sigpy_nufft(im_size, oversamp=2.0, width=6)
+# nufft_gt = matrix_nufft(im_size, spatial_batch_size=2**10)
 A_gt = sense_linop(trj, mps, dcf, nufft=nufft_gt, **kwargs)
 ksp_gt = A_gt(img)
 
 # Compare with sigpy
 nufft_sp = sigpy_nufft(im_size, oversamp=os, width=kern_size[0])
+nufft_sp.beta = nufft_sp.optimal_beta(torch_dev=torch_dev)
+# nufft_sp = mr_recon_nufft(im_size, oversamp=os, width=kern_size[0])
+# nufft_sp.param = nufft_sp.opt_param(torch_dev=torch_dev)
+# nufft_sp.plan(trj[None,])
 A_sp = sense_linop(trj, mps, dcf, nufft=nufft_sp, **kwargs)
 
 # Compare with hofft
-hparams = hofft_params(kern_size=kern_size, os=os, L=1, spatial_init='eigen')
-kern_weights, spatial_factor = als_nufft(trj, im_size, hparams, num_als_iter=1000, im_size_low=(50,)*2)
+hparams = hofft_params(kern_size=kern_size, 
+                       spatial_init='500_alphas_100',
+                    #    spatial_init='ones',
+                    #    spatial_init='seg',
+                    #    spatial_init='eigen',
+                    #    anderson_order=3,
+                       kalpha_method='kmeans',
+                       os=os, L=1)
+kern_weights, spatial_factor = als_nufft(trj, im_size, hparams,
+                                         spatial_mask=spatial_mask,
+                                         num_als_iter=0, 
+                                        #  im_size_low=(70,)*2,
+                                         )
+
 trj_grd = (trj * os).round() / os
-A_hofft = hofft_linop(trj_grd, mps, kern_weights, spatial_factor, dcf=dcf, os_grid=os)
+A_hofft = hofft_linop(trj_grd, mps, kern_weights, spatial_factor, dcf=dcf, os_grid=os, bparams=kwargs['bparams'])
 
 # Recon all
-max_iter = 30
 max_eigen = None
 img_gt = CG_SENSE_recon(A_gt, ksp_gt, max_iter=max_iter, max_eigen=max_eigen).cpu().rot90()
 img_sp = CG_SENSE_recon(A_sp, ksp_gt, max_iter=max_iter, max_eigen=max_eigen).cpu().rot90()
 img_hofft = CG_SENSE_recon(A_hofft, ksp_gt, max_iter=max_iter, max_eigen=max_eigen).cpu().rot90()
 
-# Show results real part
+# Normalize relative to ground truth
+# img_sp *= img_gt.abs().max() / img_sp.abs().max()
+# img_hofft *= img_gt.abs().max() / img_hofft.abs().max()
+img_sp = normalize(img_sp, img_gt, mag=False, ofs=True)
+img_hofft = normalize(img_hofft, img_gt, mag=False, ofs=True)
+
+# Show results
 plt.figure(figsize=(14, 7))
-plt.subplot(131)
-plt.imshow(img_gt.abs(), cmap='gray', vmin=0, vmax=0.75)
-plt.axis('off')
-plt.subplot(132)
-plt.imshow(img_sp.abs(), cmap='gray', vmin=0, vmax=0.75)
-plt.axis('off')
-plt.subplot(133)
-plt.imshow(img_hofft.abs(), cmap='gray', vmin=0, vmax=0.75)
-plt.axis('off')
+imgs = [img_gt, img_sp, img_hofft]
+titles = ['Ground Truth', 'Sigpy', 'HOFFT']
+vmax = 0.5
+for i in range(len(imgs)):
+    # image
+    plt.subplot(2, 3, i+1)
+    plt.imshow(imgs[i].abs(), cmap='gray', vmin=0, vmax=vmax)
+    plt.axis('off')
+    plt.title(titles[i])
+    
+    # error
+    nrmse = (imgs[i] - img_gt).norm() / img_gt.norm()
+    M = 10
+    plt.subplot(2, 3, i+4)
+    plt.title(f'Error({M}x), NRMSE = {100*nrmse:.2f}%')
+    plt.imshow((imgs[i].abs() - img_gt.abs()).abs(), cmap='gray', vmin=0, vmax=vmax/M)
+    plt.axis('off')
+    
+    
 plt.tight_layout()
 plt.show()

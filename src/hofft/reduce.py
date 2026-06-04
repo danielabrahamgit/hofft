@@ -158,6 +158,7 @@ def _solve_1d_kern(phi: torch.Tensor,
         
         # Solve least squares
         weights = torch.linalg.solve(A.H @ A, A.H @ B).T # Nkerns W
+        # weights = (torch.linalg.pinv(A) @ B).T # Nkerns W
         return weights
     
     # Setup least squares to get apodization function
@@ -200,7 +201,7 @@ def alpha_interp_kerns(phis: torch.Tensor,
                        W: int = 2,
                        dalphas: Union[float, tuple] = 0.5,
                        Nkerns: int = 100,
-                       solve_apod: bool = False) -> torch.Tensor:
+                       solve_apod: bool = False) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Solves for 1d interpolation weights for interpolating in an alpha direction.
     
@@ -223,6 +224,8 @@ def alpha_interp_kerns(phis: torch.Tensor,
         Kernel weights with shape (B, Nkerns, W)
     delta_alphas : torch.Tensor
         Delta alphas with shape (B, Nkerns)
+    apods : torch.Tensor
+        Apodization functions with shape (B, *im_size), None if solve_apod is False
     """
     # Consts
     B = phis.shape[0]

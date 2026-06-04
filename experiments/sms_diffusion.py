@@ -23,22 +23,24 @@ from hofft.phase_coeffs import (
   compress_phis_alphas,
 )
 
-# HOFFT params
+# Params
+max_iter = 5
 num_als_iter = 0
 hparams = hofft_params(kern_size=(5,5,2),
                        os=2.0,
                        L=6*2,
-                       spatial_init='100_alphas_10'
-                       )
-rparams = reduce_params(alpha_reduce_use_apod=True,
-                        alpha_reduce_width=2,
-                        spatial_reduce_size=(160,160,2),
-                        alpha_reduce_grid_spacing=0.5,
-                        alpha_interp_batch_size=2**10)
+                       spatial_init='100_alphas_10',
+                       matvec_kwargs={'temporal_batch_size': 2**10}
+)
+rparams = reduce_params(spatial_reduce_size=(160,160,2),
+                        # alpha_reduce_use_apod=True,
+                        # # alpha_reduce_width=2,
+                        # alpha_reduce_grid_spacing=0.5
+)
 
 # Load data
 d = 0
-torch_dev = torch.device(5)
+torch_dev = torch.device(6)
 fpath = '/local_mount/space/mayday/data/users/zachs/festive/analysis/20260113_hofft_benchmarks/data/raw/spi_dwi_mb2_z12_D4/'
 data = torch.load(f'{fpath}/data.pt', map_location=torch_dev)
 ksp = data['ksp'][d]
@@ -72,12 +74,12 @@ print(im_size)
 # ------------------------- HOFFT -------------------------
 # Stack phase coefficients and normalize
 phis_dev, alphas_dev = trj_dev_to_phis_alphas(trj, im_size, hparams.os)
-phis = torch.cat([phis, phis_dev], dim=0)
-alphas = torch.cat([alphas, alphas_dev], dim=0)
+phis_stack = torch.cat([phis, phis_dev], dim=0)
+alphas_stack = torch.cat([alphas, alphas_dev], dim=0)
 
 # SVD and rescale phase coefficients
-phis, alphas = compress_phis_alphas(phis, alphas, B_compressed=5)
-phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis, alphas)
+phis_stack, alphas_stack = compress_phis_alphas(phis_stack, alphas_stack, B_compressed=5)
+phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis_stack, alphas_stack)
 
 # Perform high order phase decomposition
 kern_weights, spatial_factors = als_hofft(trj, phis_nrm, alphas_nrm, hparams, rparams,
@@ -90,18 +92,27 @@ spatial_factors *= spatial_phase
 bparams = batching_params(C*0+1)
 trj_grd = (hparams.os * trj).round()/hparams.os
 A = hofft_linop(trj_grd, mps, kern_weights, spatial_factors, dcf, os_grid=hparams.os, bparams=bparams)
-img = CG_SENSE_recon(A, ksp, max_iter=10, max_eigen=1.0)
+img = CG_SENSE_recon(A, ksp, max_iter=max_iter, max_eigen=1.0)
 
-img_gt = torch.load(f'{fpath}recon_matrix.pt', weights_only=True)[0]
+# ------------------------- Expanded encoding model -------------------------
+# phis_dev = gen_grd(im_size).to(torch_dev).moveaxis(-1, 0)
+# alphas_dev = trj.moveaxis(-1, 0)
+# phis = torch.cat([phis, phis_dev], dim=0)
+# alphas = torch.cat([alphas, alphas_dev], dim=0)
+# A = encoding_matrix(mps * spatial_phase, phis, alphas, dcf, temporal_batch_size=2**10)
+# img_gt = CG_SENSE_recon(A, ksp * temporal_phase, max_iter=max_iter, max_eigen=1.0)
+# torch.save(img_gt.cpu(), f'./img_gt_temp.pt')
+img_gt = torch.load(f'./img_gt_temp.pt', weights_only=True)
+# img_gt = torch.load(f'{fpath}recon_matrix.pt', weights_only=True)[0]
 
-# plt.figure(figsize=(14, 7))
-# plt.subplot(121)
-# plt.imshow(img_gt[..., 0].abs().rot90().cpu(), cmap='gray')
-# plt.axis('off')
-# plt.subplot(122)
-# plt.imshow(img_gt[..., 1].abs().rot90().cpu(), cmap='gray')
-# plt.axis('off')
-# plt.tight_layout()
+plt.figure(figsize=(14, 7))
+plt.subplot(121)
+plt.imshow(img_gt[..., 0].abs().rot90().cpu(), cmap='gray')
+plt.axis('off')
+plt.subplot(122)
+plt.imshow(img_gt[..., 1].abs().rot90().cpu(), cmap='gray')
+plt.axis('off')
+plt.tight_layout()
 
 # Show image
 plt.figure(figsize=(14, 7))

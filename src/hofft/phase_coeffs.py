@@ -309,7 +309,8 @@ def rescale_phis_alphas(phis: torch.Tensor,
 
 def compress_phis_alphas(phis: torch.Tensor,
                          alphas: torch.Tensor,
-                         B_compressed: int = 5,) -> tuple[torch.Tensor, torch.Tensor]:
+                         B_compressed: int = 5,
+                         eps: float = 1e-12) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compress the number of bases in the phase model using SVD.
     This method was developed by ChatGPT :) 
@@ -346,6 +347,7 @@ def compress_phis_alphas(phis: torch.Tensor,
     # Small BxB Gram matrices
     H = A @ A.H # B B
     G = P.H @ P # B B
+    G += torch.eye(B, device=G.device, dtype=G.dtype) * eps
     
     # Cholesky and Solve orthogonal basis
     L = torch.linalg.cholesky(G)
@@ -358,7 +360,7 @@ def compress_phis_alphas(phis: torch.Tensor,
     # S, U = torch.linalg.eigh(K)
     U = Q @ U # B R
     S = S ** 0.5 # B
-    V = A.H @ P.H @ U @ torch.diag(S ** -1) # B T
+    V = A.H @ P.H @ U @ torch.diag(S ** -1).type(U.dtype) # B T
 
     # Reshape and return
     phis_compressed   = (U[:, :B_compressed] * (S[:B_compressed] ** 0.5)).T.reshape((B_compressed, *im_size))
@@ -369,8 +371,8 @@ def apply_phase_midpoints(phis_nrm: torch.Tensor,
                           alphas_nrm: torch.Tensor,
                           phis_mp: torch.Tensor,
                           alphas_mp: torch.Tensor,
-                          kern_weights: torch.Tensor,
-                          spatial_factors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                          spatial_factors: torch.Tensor,
+                          temporal_factors: torch.Tensor,) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply phase midpoints to the phase coefficients.
     
@@ -384,24 +386,24 @@ def apply_phase_midpoints(phis_nrm: torch.Tensor,
         The spatial phase midpoints, shape (B,)
     alphas_mp : torch.Tensor
         The temporal phase midpoints, shape (B,)
-    kern_weights : torch.Tensor
-        The kernel weights, shape (B, *kern_size)
     spatial_factors : torch.Tensor
-        The spatial factors, shape (B, *im_size)
+        The spatial factors, shape (..., *im_size)
+    temporal_factors : torch.Tensor
+        The temporal factors, shape (... *trj_size)
 
     Returns
     -------
-    phis : torch.Tensor
-        The spatial phase bases with phase midpoints applied, shape (B, *im_size)
-    alphas : torch.Tensor
-        The temporal phase coefficients with phase midpoints applied, shape (B, *trj_size)
+    spatial_factors : torch.Tensor
+        The spatial factors, shape (..., *im_size)
+    temporal_factors : torch.Tensor
+        The temporal factors, shape (... *trj_size)
     """
     spatial_mp = torch.exp(-2j * torch.pi * einsum(phis_nrm, alphas_mp, 'B ..., B -> ...')) # *im_size
     temporal_mp = torch.exp(-2j * torch.pi * einsum(alphas_nrm, phis_mp, 'B ..., B -> ...')) # *trj_size
     temporal_mp *= torch.exp(-2j * torch.pi * (phis_mp @ alphas_mp))
-    kern_weights *= temporal_mp
+    temporal_factors *= temporal_mp
     spatial_factors *= spatial_mp
-    return kern_weights, spatial_factors
+    return spatial_factors, temporal_factors
     
 def uniform_quantization(coeffs: torch.Tensor, 
                          grid_spacing: float,) -> tuple[torch.Tensor, torch.Tensor]:

@@ -10,11 +10,12 @@ from hofft.reduce import reduce_temporal, alpha_interp_kerns, expand_temporal
 torch.manual_seed(0)
 
 # consts
-os = 2.0
-W = 2
+os = 1.13
+W = 3
 im_size = (220,)
 trj_size = (300,)
-torch_dev = torch.device('cpu')
+# torch_dev = torch.device('cpu')
+torch_dev = torch.device(6)
 
 # Generate phis alphas
 rs = torch.arange(-(im_size[0]//2), (im_size[0]//2), device=torch_dev) / im_size[0]
@@ -86,9 +87,9 @@ for i in range(enc_mat.shape[0]):
 alphas += ofs
 dalphas = (1/os,)
 dalphas_tensor = torch.tensor(dalphas, device=torch_dev)
-weights, delta_alphas = alpha_interp_kerns(phis, W=W, dalphas=dalphas)
+weights, delta_alphas, apod = alpha_interp_kerns(phis, W=W, dalphas=dalphas, solve_apod=True)
 alphas_unq, alpha_kern, alpha_to_unq_idx = reduce_temporal(alphas, W=W, dalphas=dalphas)
-enc_mat_grid = torch.exp(-2j * torch.pi * (alphas_unq @ phis)) # G R
+enc_mat_grid = torch.exp(-2j * torch.pi * (alphas_unq @ phis)) * apod # G R
 enc_mat_exp = expand_temporal(enc_mat_grid.T, alphas, dalphas, weights, delta_alphas, alpha_kern, alpha_to_unq_idx)
 enc_mat_exp = enc_mat_exp.T
 
@@ -101,11 +102,11 @@ I = len(encs)
 for i, enc in enumerate(encs):
     plt.subplot(2,I,i + 1)
     plt.title(titles[i])
-    plt.imshow(enc.angle(), cmap='jet', vmin=-torch.pi, vmax=torch.pi)
+    plt.imshow(enc.angle().cpu(), cmap='jet', vmin=-torch.pi, vmax=torch.pi)
     # plt.imshow(enc.abs(), cmap='RdBu', vmin=0.8, vmax=1.2)
     plt.axis('off')
     plt.subplot(2,I,i + I + 1)
-    plt.imshow((enc - enc_mat).abs(), cmap='gray', vmin=0, vmax=0.2)
+    plt.imshow((enc - enc_mat).abs().cpu(), cmap='gray', vmin=0, vmax=0.2)
     plt.axis('off')
     print((enc - enc_mat).norm())
 plt.tight_layout()
