@@ -8,7 +8,7 @@ from matplotlib.colors import LogNorm
 from mr_recon.utils import normalize
 
 # Load data
-data = torch.load('./paper_figures/recons/coco_spiral.pt',
+data = torch.load('./paper_figures/recons/highres_spiral.pt',
                   map_location=torch.device('cpu'),
                   weights_only=True)
 imgs_hofft = data['imgs_hofft']
@@ -116,4 +116,4 @@ plot_time_vs_error(times_hofft[..., -1], nrmses_hofft,
                    times_hofft[..., -1], nrmses_split,
                    label1='HOFFT',
                    label2='Splitting')
-plt.show()
+plt.show() 

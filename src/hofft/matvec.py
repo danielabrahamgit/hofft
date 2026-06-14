@@ -16,9 +16,45 @@ from mr_recon.fourier import sigpy_nufft, fft, ifft
 from mr_recon.spatial import spatial_resize_poly
 from mr_recon.algs import svd_operator
 from mr_recon.imperfections.field import rescale_phis_alphas
-from typing import Optional
+from typing import Literal, Optional, Union
 from einops import einsum
-from .phase_coeffs import uniform_quantization, kmeans_quantization
+from .phase_coeffs import (
+    uniform_quantization, 
+    kmeans_quantization, 
+    maxmin_quantization
+)
+
+SubsampleMode = Literal['random', 'fixed']
+
+def subsample_count(size: int, 
+                    spec: Optional[Union[int, float]]) -> int:
+    """
+    Resolve a subsample specification to a sample count in [1, size].
+    None uses all elements; floats in (0, 1) are treated as fractions.
+    """
+    if spec is None:
+        return size
+    if isinstance(spec, float):
+        return max(1, min(size, int(size * spec)))
+    return max(1, min(size, int(spec)))
+
+def subsample_idx(size: int,
+                  count: int,
+                  device: torch.device,
+                  mode: SubsampleMode = 'random',
+                  seed: int = 0) -> torch.Tensor:
+    """
+    Return `count` distinct indices from {0, ..., size - 1}.
+    
+    mode='fixed' draws a reproducible subset (seeded). mode='random' redraws 
+    on every call.
+    """
+    if count >= size:
+        return torch.arange(size, device=device)
+    if mode == 'fixed':
+        gen = torch.Generator(device=device).manual_seed(seed)
+        return torch.randperm(size, generator=gen, device=device)[:count]
+    return torch.randperm(size, device=device)[:count]
 
 class matvec(torch.nn.Module):
     """
@@ -795,6 +831,8 @@ class matvec_histogram(matvec):
                  dalpha: Optional[float] = None,
                  Kphi: Optional[int] = None,
                  Kalpha: Optional[int] = None,
+                 Mphi: Optional[int] = None,
+                 Malpha: Optional[int] = None,
                  **kwargs):
         """
         Args
@@ -808,9 +846,14 @@ class matvec_histogram(matvec):
         dalpha : Optional[float]
             alpha quantization step size
         Kphi : Optional[int]
-            number of phi quantization bins
+            number of phi quantization bins for kmeans
         Kalpha : Optional[int]
-            number of alpha quantization bins
+            number of alpha quantization bins for kmeans
+        Mphi : Optional[int]
+            number of phi quantization bins for maxmin
+        Malpha : Optional[int]
+            number of alpha quantization bins for maxmin
+            
         """
         super(matvec_histogram, self).__init__(phis, alphas, **kwargs)
         
@@ -821,6 +864,8 @@ class matvec_histogram(matvec):
                 phis_quant, phis_inds = uniform_quantization(phis_flt, dphi)
             elif Kphi is not None:
                 phis_quant, phis_inds = kmeans_quantization(phis_flt, Kphi)
+            elif Mphi is not None:
+                phis_quant, phis_inds = maxmin_quantization(phis_flt, Mphi)
         else:
             phis_quant = phis_flt
             phis_inds = torch.arange(phis_quant.shape[1], device=phis_quant.device)
@@ -834,6 +879,8 @@ class matvec_histogram(matvec):
                 alphas_quant, alphas_inds = uniform_quantization(alphas_flt, dalpha)
             elif Kalpha is not None:
                 alphas_quant, alphas_inds = kmeans_quantization(alphas_flt, Kalpha)
+            elif Malpha is not None:
+                alphas_quant, alphas_inds = maxmin_quantization(alphas_flt, Malpha)
         else:
             alphas_quant = alphas_flt
             alphas_inds = torch.arange(alphas_quant.shape[1], device=alphas_quant.device)

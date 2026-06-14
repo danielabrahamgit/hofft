@@ -13,7 +13,8 @@ Below we provide functions to express, resize, and process these phase coefficie
 import torch
 import numpy as np
 
-from mr_recon.utils import gen_grd
+from typing import Optional
+from mr_recon.utils import gen_grd, pick_K_vectors
 from einops import einsum
 from fast_pytorch_kmeans import KMeans
 
@@ -243,8 +244,9 @@ def trj_dev_to_phis_alphas(trj: torch.Tensor,
     return phis, alphas
 
 def rescale_phis_alphas(phis: torch.Tensor,
-                        alphas: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
+                        alphas: torch.Tensor,
+                        norm_dists: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    f"""
     Phase model is 
     phase(r, t) = 2pi sum_k phi_k(r) * alpha_k(t)
     
@@ -262,6 +264,9 @@ def rescale_phis_alphas(phis: torch.Tensor,
         Phase basis with shape (B, *im_size)
     alphas : torch.Tensor
         Phase coefficients with shape (B, *trj_size)
+    norm_dists : bool
+        If True, normalizes distances by doing:
+        G = phis @ phis.T, phis = G^{-1/2} @ phis, alphas = G^{1/2} @ alphas
         
     Returns
     --------
@@ -302,6 +307,20 @@ def rescale_phis_alphas(phis: torch.Tensor,
     alphas_flt_cent *= scales[:, None]
     alphas_mp *= scales
     
+    # Normalize distances
+    if norm_dists:
+        G = phis_flt_cent @ phis_flt_cent.T / R
+        evals, evecs = torch.linalg.eigh(G)
+        evals = evals.clamp(min=1e-6)
+        G_half = (evecs * (evals ** 0.5).unsqueeze(0)) @ evecs.T
+        G_half_inv = (evecs * (evals ** -0.5).unsqueeze(0)) @ evecs.T
+        I = G_half @ G_half_inv
+        assert torch.allclose(I, torch.eye(B, device=phis_flt.device), atol=1e-5)
+        phis_flt_cent = G_half_inv @ phis_flt_cent
+        alphas_flt_cent = G_half @ alphas_flt_cent
+        phis_mp = G_half_inv @ phis_mp
+        alphas_mp = G_half @ alphas_mp
+        
     # Reshape and return
     phis_nrm = phis_flt_cent.reshape((B, *im_size))
     alphas_nrm = alphas_flt_cent.reshape((B, *trj_size))
@@ -309,11 +328,10 @@ def rescale_phis_alphas(phis: torch.Tensor,
 
 def compress_phis_alphas(phis: torch.Tensor,
                          alphas: torch.Tensor,
-                         B_compressed: int = 5,
-                         eps: float = 1e-12) -> tuple[torch.Tensor, torch.Tensor]:
+                         B_compressed: int = 5) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Compress the number of bases in the phase model using SVD.
-    This method was developed by ChatGPT :) 
+    A = PHI.T @ ALPHA with shape (im_size, trj_size).
+    This function finds the best rank-B_compressed approximation to A using SVD, efficiently.
     
     Args
     ----
@@ -341,26 +359,19 @@ def compress_phis_alphas(phis: torch.Tensor,
     assert B_compressed <= B, "B_compressed must be less than or equal to B"
     
     # Flatten everything
-    P = phis.reshape((B, R)).T
-    A = alphas.reshape((B, T))
+    P = phis.reshape((B, R)).T # left
+    A = alphas.reshape((B, T)) # right
     
-    # Small BxB Gram matrices
-    H = A @ A.H # B B
-    G = P.H @ P # B B
-    G += torch.eye(B, device=G.device, dtype=G.dtype) * eps
+    # QR decompose
+    Ql, Tl = torch.linalg.qr(P, mode='reduced')
+    Qr, Tr = torch.linalg.qr(A.T, mode='reduced')
     
-    # Cholesky and Solve orthogonal basis
-    L = torch.linalg.cholesky(G)
-    # Q = P @ torch.linalg.inv(L).H
-    Q = torch.linalg.solve(L.H, P, left=False)
-    
-    # Decompose and form new SVD terms
-    K = L.H @ H @ L # B B
-    U, S, _ = torch.linalg.svd(K, full_matrices=False) # B B
-    # S, U = torch.linalg.eigh(K)
-    U = Q @ U # B R
-    S = S ** 0.5 # B
-    V = A.H @ P.H @ U @ torch.diag(S ** -1).type(U.dtype) # B T
+    # SVD 
+    M = Tl @ Tr.T
+    U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+    U = Ql @ U
+    Vh = Vh @ Qr.T
+    V = Vh.T
 
     # Reshape and return
     phis_compressed   = (U[:, :B_compressed] * (S[:B_compressed] ** 0.5)).T.reshape((B_compressed, *im_size))
@@ -371,8 +382,8 @@ def apply_phase_midpoints(phis_nrm: torch.Tensor,
                           alphas_nrm: torch.Tensor,
                           phis_mp: torch.Tensor,
                           alphas_mp: torch.Tensor,
-                          spatial_factors: torch.Tensor,
-                          temporal_factors: torch.Tensor,) -> tuple[torch.Tensor, torch.Tensor]:
+                          spatial_factors: Optional[torch.Tensor] = None,
+                          temporal_factors: Optional[torch.Tensor] = None,) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply phase midpoints to the phase coefficients.
     
@@ -388,8 +399,10 @@ def apply_phase_midpoints(phis_nrm: torch.Tensor,
         The temporal phase midpoints, shape (B,)
     spatial_factors : torch.Tensor
         The spatial factors, shape (..., *im_size)
+        defaults to ones with shape (*im_size)
     temporal_factors : torch.Tensor
         The temporal factors, shape (... *trj_size)
+        defaults to ones with shape (*trj_size)
 
     Returns
     -------
@@ -398,6 +411,10 @@ def apply_phase_midpoints(phis_nrm: torch.Tensor,
     temporal_factors : torch.Tensor
         The temporal factors, shape (... *trj_size)
     """
+    if spatial_factors is None:
+        spatial_factors = torch.ones_like(phis_nrm[0]).type(torch.complex64)
+    if temporal_factors is None:
+        temporal_factors = torch.ones_like(alphas_nrm[0]).type(torch.complex64)
     spatial_mp = torch.exp(-2j * torch.pi * einsum(phis_nrm, alphas_mp, 'B ..., B -> ...')) # *im_size
     temporal_mp = torch.exp(-2j * torch.pi * einsum(alphas_nrm, phis_mp, 'B ..., B -> ...')) # *trj_size
     temporal_mp *= torch.exp(-2j * torch.pi * (phis_mp @ alphas_mp))
@@ -454,9 +471,9 @@ def kmeans_quantization(coeffs: torch.Tensor,
     Returns
     -------
     coeffs_quant : torch.Tensor
-        Smaller set of quantized coefficients (B, M), M <= N
+        Smaller set of quantized coefficients (B, K), K <= N
     inds_quant : torch.Tensor
-        Indices mapping from original coefficients to quantized coefficients with shape (N,) in [0, M)
+        Indices mapping from original coefficients to quantized coefficients with shape (N,) in [0, K)
     """
     # Consts
     assert coeffs.ndim == 2
@@ -480,4 +497,33 @@ def kmeans_quantization(coeffs: torch.Tensor,
     coeffs_quant = kmeans.centroids.T
 
     
+    return coeffs_quant, inds_quant
+
+def maxmin_quantization(coeffs: torch.Tensor,
+                        K: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Maxmin quantization of phase coefficients.
+    
+    Args
+    ----
+    coeffs : torch.Tensor
+        phi or alpha phase coefficients with shape (B, N)
+    K : int
+        Number of coefficients to quantize to
+        
+    Returns
+    -------
+    coeffs_quant : torch.Tensor
+        Smaller set of quantized coefficients (B, M), M <= N
+    inds_quant : torch.Tensor
+        Indices mapping from original coefficients to quantized coefficients with shape (N,) in [0, M)
+    """
+    N = coeffs.shape[1]
+    coeffs_quant, _ = pick_K_vectors(coeffs.T, K=K, method='maxmin', return_idxs=False)
+    coeffs_quant = coeffs_quant.T
+    
+    # Find indices mapping from original coefficients to quantized coefficients
+    inds_quant = torch.empty((N,), dtype=torch.long, device=coeffs.device)
+    for i in range(N):
+        inds_quant[i] = torch.argmin(torch.norm(coeffs[i] - coeffs_quant, dim=1))
     return coeffs_quant, inds_quant

@@ -5,13 +5,17 @@ import matplotlib
 matplotlib.use('Webagg')
 import matplotlib.pyplot as plt
 
-from hofft.decomp import hofft_params
-from hofft.pipelines import als_hofft
 from hofft.reduce import reduce_params
-from hofft.phase_coeffs import rescale_phis_alphas, apply_phase_midpoints
-from hofft.forward_model import hofft_linop, hofft_compressed_linop
-
-
+from hofft.forward_model import hofft_compressed_linop, hofft_linop
+from hofft.sparse_decomp import sparse_params
+from hofft.decomp import hofft_params
+from hofft.pipelines import als_hofft_compressed, als_hofft
+from hofft.phase_coeffs import (
+  trj_dev_to_phis_alphas,
+  compress_phis_alphas,
+  rescale_phis_alphas,
+  apply_phase_midpoints,
+)
 from mr_recon.imperfections.field import b0_to_phis_alphas, alpha_segementation
 from mr_recon.linops import sense_linop, batching_params
 from mr_recon.recons import CG_SENSE_recon
@@ -20,8 +24,32 @@ from mr_recon.utils import normalize, cvplot
 
 from scipy.ndimage import gaussian_filter
 
+# Params
+R = 3
+B_compressed = None
+torch_dev = torch.device(0)
+hparams = hofft_params(kern_size=(5,)*3,
+                       os=1.25,
+                       L=5,
+                       reduced_im_size=(100,)*3,
+                       spatial_init='seg',
+                       solver='pinv',
+                       lamda=1e-3*0,
+                       verbose=True)
+sparams = sparse_params(Q=1_500, K=16, 
+                        beta_method='maxmin', 
+                        # interp_method='lstsq', 
+                        # interp_method='rbf', 
+                        interp_method='grid', 
+                        grid_spacing=0.25,
+                        grid_width=2,
+                        spatial_subsample=2**13,
+                        temporal_batch_size=2**10, 
+                        lamda=1e-3, 
+                        normalize_coeffs=True)
+bparams = batching_params(coil_batch_size=1)
+
 # Load 3D MRF data
-torch_dev = torch.device(2)
 fdir = '/local_mount/space/tiger/1/users/abrahamd/mr_data/mrf_b0/data'
 trj = torch.from_numpy(np.load(f'{fdir}/trj.npy')).to(torch_dev)
 dcf = torch.from_numpy(np.load(f'{fdir}/dcf.npy')).to(torch_dev)
@@ -30,20 +58,12 @@ mps = torch.from_numpy(np.load(f'{fdir}/mps.npy')).to(torch_dev)
 im_size = mps.shape[1:]
 C = mps.shape[0]
 dcf /= dcf.max()
+hparams.os = 2 * round(hparams.os * im_size[0] / 2) / im_size[0] # Round to nearest even integer
 
 # Filter b0 map
 b0 = np.load(f'{fdir}/b0.npy')
 # b0 = gaussian_filter(b0, sigma=3)
 b0 = torch.from_numpy(b0).to(torch_dev)
-
-# Params
-R = 3
-bparams = batching_params(coil_batch_size=1,
-                          field_batch_size=1)
-hparams = hofft_params(kern_size=(3,)*3,
-                       os=1.25,
-                       L=8,)
-hparams.os = 2 * round(hparams.os * im_size[0] / 2) / im_size[0] # Round to nearest even
 
 # Undersample groups
 # grps = slice(None, None, R)
@@ -59,35 +79,47 @@ print(f'Dcf shape: {dcf.shape}')
 print(f'Ksp shape: {ksp.shape}')
 print(f'Mps shape: {mps.shape}')
 
-# HOFT Recon
-trj_grd = (trj * hparams.os).round() / hparams.os
-spatial_factors = torch.randn((hparams.L, *im_size), device=torch_dev, dtype=torch.complex64)
-# kern_weights = torch.randn((hparams.L, *hparams.kern_size, *trj_size), device=torch_dev, dtype=torch.complex64)
-# A = hofft_linop(trj_grd, mps, kern_weights, spatial_factors, dcf, os_grid=hparams.os, bparams=bparams)
-S = 8
-Q = 1000
-compressed_kernels = torch.randn((hparams.L, *hparams.kern_size, Q), device=torch_dev, dtype=torch.complex64)
-sparse_idxs = torch.randint(0, Q, (S, *trj_size), device=torch_dev, dtype=torch.long)
-sparse_coeffs = torch.randn((S, *trj_size), device=torch_dev, dtype=torch.complex64)
-A = hofft_compressed_linop(trj_grd, mps, dcf=dcf, 
-                           compressed_kernels=compressed_kernels, 
-                           spatial_factors=spatial_factors,
-                           sparse_idxs=sparse_idxs, 
-                           sparse_coeffs=sparse_coeffs, 
-                           os_grid=hparams.os, bparams=bparams)
-img_hofft = CG_SENSE_recon(A, ksp, max_iter=10, max_eigen=1.0).cpu()
+# ----------------- Process phase coefficients -----------------
+# Stack phase coefficients, compress, rescale
+phis_b0, alphas_b0 = b0_to_phis_alphas(b0, trj_size, 0, 2e-6, repeat_empty_dims=True)
+phis_dev, alphas_dev = trj_dev_to_phis_alphas(trj, im_size, hparams.os)
+phis_stack = torch.cat([phis_b0, phis_dev], dim=0)
+alphas_stack = torch.cat([alphas_b0, alphas_dev], dim=0)
+if B_compressed is not None:
+    phis_stack, alphas_stack = compress_phis_alphas(phis_stack, alphas_stack, 
+                                                    B_compressed=B_compressed)
+phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis_stack, alphas_stack)
 
-# B0 correction
-nufft = sigpy_nufft(im_size, oversamp=hparams.os, width=hparams.kern_size[0])
-nufft.beta = nufft.optimal_beta(torch_dev=torch_dev)
-phis, alphas = b0_to_phis_alphas(b0, trj_size, 0, 2e-6)
-b, h, _ = alpha_segementation(phis, alphas, L=hparams.L, interp_type='lstsq')
-A = sense_linop(trj, mps, dcf, 
-                spatial_funcs=b, 
-                temporal_funcs=h,
-                nufft=nufft,
-                bparams=bparams)
-img_b0 = CG_SENSE_recon(A, ksp, max_iter=10, max_eigen=1.0).cpu()
+# ----------------- Compressed HOFFT Decomposition -----------------
+# ALS decomp and apply phase midpoints
+rets = als_hofft_compressed(phis_nrm, alphas_nrm, hparams=hparams, sparams=sparams,
+                            num_als_iter=10)
+spatial_factors, compressed_kernels, sparse_inds, sparse_coeffs = rets
+spatial_factors, sparse_coeffs = apply_phase_midpoints(phis_nrm, alphas_nrm,
+                                                       phis_mp, alphas_mp,
+                                                       spatial_factors, sparse_coeffs)
+
+# Build compressed HOFFT linear operator
+trj_grd = (trj * hparams.os).round() / hparams.os
+A_comp = hofft_compressed_linop(trj_grd, mps, 
+                                dcf=dcf,
+                                compressed_kernels=compressed_kernels,
+                                sparse_idxs=sparse_inds, sparse_coeffs=sparse_coeffs,
+                                spatial_factors=spatial_factors, os_grid=hparams.os,
+                                bparams=bparams)
+img_hofft = CG_SENSE_recon(A_comp, ksp, max_iter=10, max_eigen=1.0).cpu()
+
+# # B0 correction
+# nufft = sigpy_nufft(im_size, oversamp=hparams.os, width=hparams.kern_size[0])
+# nufft.beta = nufft.optimal_beta(torch_dev=torch_dev)
+# phis, alphas = b0_to_phis_alphas(b0, trj_size, 0, 2e-6)
+# b, h, _ = alpha_segementation(phis, alphas, L=hparams.L, interp_type='lstsq')
+# A = sense_linop(trj, mps, dcf, 
+#                 spatial_funcs=b, 
+#                 temporal_funcs=h,
+#                 nufft=nufft,
+#                 bparams=bparams)
+# img_b0 = CG_SENSE_recon(A, ksp, max_iter=10, max_eigen=1.0).cpu()
 
 # Naive recon
 nufft = sigpy_nufft(im_size, oversamp=hparams.os, width=hparams.kern_size[0])
@@ -98,8 +130,10 @@ A = sense_linop(trj, mps, dcf,
 img_naive = CG_SENSE_recon(A, ksp, max_iter=10, max_eigen=1.0).cpu()
 
 plt.figure(figsize=(14, 7))
-imgs = [img_naive, img_b0, img_hofft]
-titles = ['Naive', 'B0 Corrected', 'HOFT']
+imgs = [img_naive, img_hofft]
+titles = ['Naive', 'HOFFT']
+# imgs = [img_naive, img_b0, img_hofft]
+# titles = ['Naive', 'B0 Corrected', 'HOFFT']
 for i in range(len(imgs)):
     plt.subplot(1, len(imgs), i+1)
     plt.imshow(imgs[i][..., 70].abs().rot90(), cmap='gray')

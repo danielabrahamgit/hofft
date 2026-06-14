@@ -4,11 +4,14 @@ import numpy as np
 from mr_recon.linops import linop, batching_params
 from mr_recon.utils import gen_grd, batch_iterator, resize
 from mr_recon.fourier import fft, ifft
-from mr_recon._func.indexing import multi_index, multi_grid
+from mr_recon._func.indexing import multi_index, multi_grid, ravel
 from mr_recon._func.pad import PadLast
+
+from .triton_forward import hofft_forward_fused, hofft_adjoint_fused
 
 from typing import Optional
 from einops import einsum
+from tqdm import tqdm
 
 __all__ = [
     'hofft_linop', 
@@ -309,6 +312,15 @@ class hofft_compressed_linop(linop):
         self.sparse_coeffs = sparse_coeffs
         self.bparams = bparams
         self.spatial_factors = spatial_factors
+
+        # Precompute flattened indices/tensors for the fused forward kernel.
+        # idx_lin: (T, K) raveled linear indices into prod(im_size_os).
+        T = int(np.prod(trj_size))
+        K = idx_kerns.shape[-2]
+        self.trj_size = trj_size
+        self.idx_lin = ravel(idx_kerns, im_size_os, dim=-1).reshape(T, K).to(torch.int32)
+        self.sparse_idxs_flat = sparse_idxs.reshape(sparse_idxs.shape[0], T)
+        self.sparse_coeffs_flat = sparse_coeffs.reshape(sparse_coeffs.shape[0], T)
         
     def forward(self,
                 img: torch.Tensor) -> torch.Tensor:
@@ -353,17 +365,15 @@ class hofft_compressed_linop(linop):
                 FMSx = fft(MSx, dim=tuple(range(-D, 0)))
                 FMSx *= np.prod(FMSx.shape[-D:])**0.5 / np.prod(self.im_size)**0.5
                 
-                # Extract blocks of k-space data
-                blocks = multi_index(FMSx, D, self.idx_kerns) # (C, L, *trj_size, K)
-                blocks = blocks.moveaxis(-1, 2) # (C, L, K, *trj_size)
-                
-                # Apply sparse model to get kernels
-                kern_weights = self.compressed_kernels[l1:l2, :, self.sparse_idxs] # L K S *trj_size
-                kern_weights = einsum(kern_weights, self.sparse_coeffs, 'L K S ..., S ... -> L K ...')
-                
-                # Apply kernels
-                KFSx = einsum(blocks, kern_weights, 'C L K ..., L K ... -> C ...')
-                ksp[c1:c2] += KFSx
+                # Fused block-extraction + sparse-kernel apply (avoids materializing
+                # the (C,L,K,*trj) blocks and (L,K,S,*trj) gather intermediates).
+                FMSx = FMSx.reshape(FMSx.shape[0], FMSx.shape[1], -1) # (C, L, NPIX)
+                KFSx = hofft_forward_fused(FMSx,
+                                        self.idx_lin,
+                                        self.compressed_kernels[l1:l2],
+                                        self.sparse_idxs_flat,
+                                        self.sparse_coeffs_flat)
+                ksp[c1:c2] += KFSx.reshape(c2 - c1, *self.trj_size)
             
         return ksp
     
@@ -401,15 +411,15 @@ class hofft_compressed_linop(linop):
             # Batch over field/basis terms to keep the (C, L, *trj_size, K) tensor small
             for l1, l2 in batch_iterator(L, fbs):
                 
-                # Extract kernel weights from sparse model
-                kern_weights = self.compressed_kernels[l1:l2, :, self.sparse_idxs] # L K S *trj_size
-                kern_weights = einsum(kern_weights, self.sparse_coeffs, 'L K S ..., S ... -> L K ...')
-                
-                # Get Kernels
-                Ky = einsum(y, kern_weights.conj(), 'C ..., L K ... -> C L ... K')
-                
-                # Gridding 
-                Ky = multi_grid(Ky, self.idx_kerns, self.im_size_os) # (C, L, *im_size_os)
+                # Fused sparse-kernel apply + gridding (transpose of the forward fusion;
+                # avoids the (L,K,S,*trj) gather and (C,L,*trj,K) Ky intermediates).
+                Ky = hofft_adjoint_fused(y.reshape(c2 - c1, -1),
+                                         self.idx_lin,
+                                         self.compressed_kernels[l1:l2],
+                                         self.sparse_idxs_flat,
+                                         self.sparse_coeffs_flat,
+                                         NPIX=int(np.prod(self.im_size_os)))
+                Ky = Ky.reshape(c2 - c1, l2 - l1, *self.im_size_os) # (C, L, *im_size_os)
                 FKy = ifft(Ky, dim=tuple(range(-D, 0)))
                 FKy *= np.prod(FKy.shape[-D:])**0.5 / np.prod(self.im_size)**0.5
                 FKy = self.padder.adjoint(FKy) # (C, L, *im_size)
