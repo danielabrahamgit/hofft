@@ -210,19 +210,23 @@ class learnable_kernels(fixed_kernel_model):
         
         return kern
 
-class sparse_network(nn.Module):
+class mlp(nn.Module):
     
     def __init__(self,
                  num_features: int,
                  num_outputs: int,
-                 sparsity: int,
+                 sparsity: Optional[int] = None,
                  num_layers: Optional[int] = 3, 
                  hidden_width: Optional[int] = 256,
                  latent_width: Optional[int] = 256,
                  num_fourier: Optional[int] = 256):
-        """
-        Initializes a sparse network, where each output vector is a 
-        linear combination of at most K terms from the second to last layer.
+        f"""
+        Initializes an MLP, with optional sparsity on outputs.
+        
+        y(x) = sum_l w_l(x) * y_l
+        w_l(x) are the outputs of the MLP latent layer
+        
+        if sparsity is not None then [w_1(x), ..., w_L(x)] have at most S non-zero terms.
         
         Args
         ----
@@ -243,8 +247,10 @@ class sparse_network(nn.Module):
         
         # Save some consts
         self.O = num_outputs
-        self.K = sparsity
+        self.S = sparsity
         self.f = num_features
+        self.num_fourier = num_fourier
+        self.Q = latent_width
         
         # Fourier features
         if num_fourier is not None:
@@ -269,6 +275,37 @@ class sparse_network(nn.Module):
         # Last layer
         self.last_layer = nn.Linear(latent_width, num_outputs, dtype=torch.complex64)
         
+        # Forward pass is different for sparse and non-sparse models
+        if sparsity is None:
+            self.forward_latent = self._forward_latent
+        else:
+            self.forward_latent = self._forward_latent_sparse
+    
+    def sparse_weights_idxs(self,
+                           feature_vecs: torch.Tensor) -> torch.Tensor:
+        """
+        Gets the sparse weights for the model
+
+        Parameters:
+        -----------
+        feature_vecs : torch.tensor <float>
+            features with shape (N, f)
+
+        Returns:
+        ----------
+        weights : torch.tensor <float>
+            weights with shape (N, S)
+        topk_inds : torch.tensor <long>
+            indices of the top S terms with shape (N, S) with values in [0, self.latent_width-1]
+        """
+        # Get latent weights
+        lweights = self._forward_latent(feature_vecs)
+        
+        # Apply sparsity
+        weights, topk_inds = self._apply_sparsity(lweights)
+        
+        return weights, topk_inds
+    
     def forward(self,
                 feature_vecs: torch.Tensor) -> torch.Tensor:
         """
@@ -284,34 +321,28 @@ class sparse_network(nn.Module):
         outputs : torch.tensor
             outputs with shape (N, num_outputs)
         """
-        # Get sparse weights
-        weights, topk_inds = self.forward_sparse(feature_vecs)
-        
-        # Embed sparse weights
-        c = torch.zeros_like(feature_vecs)
-        c.scatter_(-1, topk_inds, weights) 
+        # Get latent weights
+        lweights = self.forward_latent(feature_vecs)
         
         # Apply to output layer 
-        outputs = self.last_layer(c)
+        outputs = self.last_layer(lweights.type(torch.complex64))
         
         return outputs
     
-    def forward_sparse(self,
-                       feature_vecs: torch.Tensor) -> torch.Tensor:
+    def _forward_latent(self,
+                        feature_vecs: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass of model
+        Forward pass of model to get latent weights only
 
-        Parameters:
-        -----------
+        Args
+        ----
         feature_vecs : torch.tensor <float>
             features with shape (N, f)
-
-        Returns:
-        ----------
-        weights : torch.tensor <float>
-            weights with shape (N, K)
-        topk_inds : torch.tensor <long>
-            indices of the top K terms with shape (N, K) with values in [0, self.latent_width-1]
+        
+        Returns
+        -------
+        latent_weights : torch.tensor <complex>
+            latent weights with shape (N, Q)
         """
         # Fourier features
         if self.num_fourier is not None:
@@ -321,11 +352,57 @@ class sparse_network(nn.Module):
         # Feature extraction
         for layer in self.feature_layers:
             feature_vecs = layer(feature_vecs)
+            
+        return feature_vecs
+    
+    def _forward_latent_sparse(self,
+                               feature_vecs: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of model to get latent weights only
 
-        # Force K with convex combination
-        topk_vals, topk_inds = torch.topk(feature_vecs, dim=-1, k=self.K)
-        weights = torch.softmax(topk_vals, dim=-1)         
+        Args
+        ----
+        feature_vecs : torch.tensor <float>
+            features with shape (N, f)
+
+        Returns
+        -------
+        latent_weights : torch.tensor <complex>
+            latent weights with shape (N, Q)
+        """
+        # Fourier features
+        if self.num_fourier is not None:
+            fourier_feats = torch.cat((torch.cos(feature_vecs @ self.B), torch.sin(feature_vecs @ self.B)), dim=-1)
+            feature_vecs = torch.cat((feature_vecs, fourier_feats), dim=-1)
+            
+        # Feature extraction
+        for layer in self.feature_layers:
+            feature_vecs = layer(feature_vecs)
+            
+         # Apply sparsity
+        weights, topk_inds = self._apply_sparsity(feature_vecs)
+        
+        # Embed sparse weights
+        c = torch.zeros_like(feature_vecs)
+        c.scatter_(-1, topk_inds, weights)
+        
+        return c
+    
+    def _apply_sparsity(self,
+                        lweights: torch.Tensor) -> torch.Tensor:
+        """
+        Applies sparsity to the latent weights
+
+        Args
+        ----
+        lweights : torch.tensor <float>
+            latent weights with shape (N, Q)
+        """
+        
+        # Apply sparsity
+        topk_vals, topk_inds = torch.topk(lweights, dim=-1, k=self.S)
+        # weights = torch.softmax(topk_vals, dim=-1)    
+        weights = topk_vals
         
         return weights, topk_inds
-        
         

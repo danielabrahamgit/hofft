@@ -9,7 +9,9 @@ from typing import Optional, Mapping
 from dataclasses import dataclass
 
 from mr_recon.utils import gen_grd
-from hofft.kernel_models import learnable_kernels
+from .kernel_models import learnable_kernels, mlp
+from .decomp import hofft_params
+from .sparse_fit import sparse_params
 
 @dataclass
 class training_params:
@@ -163,16 +165,17 @@ class phase_dataset(object):
 
         return data_dct
 
-def train_net_apod(phis: torch.Tensor, 
-                   alphas: torch.Tensor, 
-                   apods_init: torch.Tensor,
-                   kern_size: tuple, 
-                   os: float, 
-                   opt_apods: Optional[bool] = True,
-                   epochs: Optional[int] = 100) -> tuple[torch.Tensor, torch.Tensor, nn.Module]:
+def train_sparse_net(phis: torch.Tensor, 
+                     alphas: torch.Tensor, 
+                     spatial_factors_init: torch.Tensor,
+                     hparams: hofft_params,
+                     sparams: sparse_params,
+                     tparams: Optional[training_params] = training_params(),
+                     spatial_mask: Optional[torch.Tensor] = None,
+                     opt_spatial_factors: bool = True,) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Train a neural network to learn the kernel weights, 
-    and grid representation of apodization functions.
+    and grid representation of spatial factors.
 
     Args:
     -----
@@ -180,72 +183,184 @@ def train_net_apod(phis: torch.Tensor,
         The spatial phase bases with shape (B, *im_size).
     alphas : torch.Tensor
         The spatial apodization bases with shape (B, *trj_size).
-    apods_init : torch.Tensor
-        The initial apodization functions with shape (L, *im_size).
-    kern_size : tuple
-        The kernel size, len(im_size) = len(kern_size).
-    os : float
-        The oversampling factor
-    opt_apods : Optional[bool]
-        If True, optimizes the apodization functions.
-        If False, uses the initial apodization functions.
-    epochs : Optional[int]
-        The number of epochs to train the model. Default is 100.
+    spatial_factors_init : torch.Tensor
+        The initial spatial factors with shape (L, *im_size).
+    hparams : hofft_params
+        The HOFFT parameters.
+    sparams : sparse_params
+        The sparse decomposition parameters.
+    tparams : training_params
+        The training parameters.
+    spatial_mask : Optional[torch.Tensor]
+        The spatial mask with shape (*im_size).
+    opt_spatial_factors : bool
+        If True, optimizes the spatial factors.
         
     Returns:
     --------
-    weights : torch.Tensor
-        The learned kernel weights with shape (L, *kern_size, *trj_size).
-    apods : torch.Tensor
-        The learned apodization functions with shape (L, *im_size).
-    kern_model : nn.Module
-        The learned kernel model.
+    spatial_factors : torch.Tensor
+        The learned spatial factors with shape (L, *im_size).
+    compressed_kernels : torch.Tensor
+        The learned compressed kernel dictionary with shape (L, *kern_size, Q).
+    bias_kern : torch.Tensor
+        The learned bias kernel with shape (L, *kern_size).
+    sparse_inds : torch.Tensor
+        The learned sparse indices (long) with shape (S, *trj_size), values in [0, Q).
+    sparse_coeffs : torch.Tensor
+        The learned sparse coefficients (real softmax weights, cast to complex64)
+        with shape (S, *trj_size).
     """
     # Consts
-    torch_dev = phis.device
-    B = phis.shape[0]
-    L = apods_init.shape[0]
     im_size = phis.shape[1:]
     trj_size = alphas.shape[1:]
+    kern_size = hparams.kern_size
+    os = hparams.os
     d = len(im_size)
-    
-    # Training parameters for the model
-    tparams = training_params(epochs=epochs*100, 
-                              batch_size=2**14, 
-                              show_loss=False, 
-                              loss=lambda x, y: (x-y).abs().square().sum(), 
-                              lr=1e-3)
+    B = phis.shape[0]
+    L = spatial_factors_init.shape[0]
+    Q = sparams.Q
+    W = np.prod(kern_size)
+    S = sparams.S
+    torch_dev = phis.device
+
+    # Default spatial mask
+    if spatial_mask is None:
+        spatial_mask = torch.ones(im_size, dtype=torch.complex64, device=torch_dev)
+
+    # Initialize sparse kernel model
+    sparse_mlp = mlp(num_features=B,
+                     num_outputs=L * np.prod(kern_size),
+                     sparsity=S,
+                     latent_width=Q,
+                     num_layers=4,
+                     hidden_width=256,
+                     num_fourier=256).to(torch_dev)
     
     # Make kernel bases vectors
     kern_vecs = gen_grd(kern_size, kern_size)
     kern_vecs = kern_vecs.to(torch_dev).reshape((-1, d)) / os
     
     # Make dataset and kernel model
-    if opt_apods:
-        source_maps = apods_init.clone().type(torch.complex64).requires_grad_(True)
+    if opt_spatial_factors:
+        source_maps = spatial_factors_init.clone().type(torch.complex64).requires_grad_(True)
     else:
-        source_maps = apods_init.clone().type(torch.complex64).requires_grad_(False)
+        source_maps = spatial_factors_init.clone().type(torch.complex64).requires_grad_(False)
     target_maps = torch.ones((1, *im_size), device=torch_dev, dtype=torch.complex64)
-    kern_model = learnable_kernels(B, kern_size, im_size, source_maps, target_maps).to(torch_dev)
+    sparse_mlp.source_maps = source_maps
+    sparse_mlp.target_maps = target_maps
     alphas_train = alphas.reshape((B, -1))
-    dataset = phase_dataset(kern_vecs, kern_model.source_maps, kern_model.target_maps, 
+    dataset = phase_dataset(kern_vecs, sparse_mlp.source_maps, sparse_mlp.target_maps, 
                             alphas_train=alphas_train, 
-                            phis_train=phis)
+                            phis_train=phis,
+                            mask=spatial_mask)
     
     # Train the model
-    kern_model = stochastic_train_fixed(kern_model, dataset, tparams, verbose=True)
+    sparse_mlp = hofft_sgd(sparse_mlp, dataset, hparams, tparams)
     
-    # Query model for weights
-    weights = kern_model.forward_kernel(alphas_train.T) # T 1 L K
-    assert weights.shape[1] == 1
-    weights = weights[:, 0].moveaxis(0, -1) # L K T
-    weights = weights.reshape((L, *kern_size, *trj_size))
+    # Get sparse weights and indices
+    sparse_coeffs, sparse_inds = sparse_mlp.sparse_weights_idxs(alphas_train.T)
+    sparse_coeffs = sparse_coeffs.T.reshape((S, *trj_size)).type(torch.complex64)
+    sparse_inds = sparse_inds.T.reshape((S, *trj_size))
     
-    # Get apodization functions
-    apods = kern_model.source_maps.detach()
+    # Compressed kernel weights and spatial factors
+    bias_kern = sparse_mlp.last_layer.bias.reshape((L, W))
+    bias_kern = bias_kern.reshape((L, *kern_size))
+    compressed_kernels = rearrange(sparse_mlp.last_layer.weight, 
+                                   '(L W) Q -> L W Q', L=L)
+    compressed_kernels = compressed_kernels.reshape((L, *kern_size, Q))
+    spatial_factors = sparse_mlp.source_maps.detach()
+
+    return spatial_factors, compressed_kernels, bias_kern, sparse_inds, sparse_coeffs
+
+def hofft_sgd(kernel_model: nn.Module,
+              data_loader: Mapping[int, dict],
+              hparams: hofft_params,
+              tparams: training_params,) -> nn.Module:
+    """
+    Train a neural network to learn the kernel weights, 
+    and grid representation of spatial factors.
     
-    return weights, apods, kern_model
- 
+    Args
+    ----
+    kernel_model : nn.Module
+        Kernel model to train
+    data_loader : Mapping[int, dict]
+        Data loader for training
+    hparams : hofft_params
+        HOFFT parameters
+    tparams : training_params
+        Training parameters
+
+    Returns
+    -------
+    kernel_model : nn.Module
+        Trained kernel model
+    """
+    # Consts
+    criterion = tparams.loss
+    lr = tparams.lr
+    epochs = tparams.epochs
+    batch_size = tparams.batch_size
+    verbose = hparams.verbose
+    L = hparams.L
+    K = np.prod(hparams.kern_size)
+
+    # Training params
+    optim = torch.optim.Adam(kernel_model.parameters(), lr=lr)
+
+    # Set precision
+    precision_old = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(tparams.float_precision)
+
+    # Train
+    losses = []
+    for _ in tqdm(range(epochs), 'Training Epochs', disable=not verbose):
+            
+        # Extract batch
+        data_dct = data_loader[batch_size]
+        feature_batch = data_dct['feature_vecs'] # B f
+        source_batch = data_dct['source_data'] # B L K
+        target_batch = data_dct['target_data'] # B M
+
+        # Get kernel weights
+        weights_batch = kernel_model(feature_batch) # B (L K M)
+        
+        # Apply weights to target
+        weights_batch = rearrange(weights_batch, 
+                                  'B (L K M) -> B L K M', L=L, K=K, M=1)
+        pred_batch = einsum(weights_batch, source_batch, 
+                            'B L K M, B L K -> B M')
+        
+        # Loss on prediction
+        loss_batch = criterion(pred_batch, target_batch)
+
+        # Update
+        loss_batch.backward()
+        optim.step()
+        for param in kernel_model.parameters():
+            param.grad = None
+        losses.append(float(loss_batch) / batch_size)
+
+    if tparams.show_loss:
+        # Debug training loss
+        import matplotlib.pyplot as plt
+        plt.plot(torch.log10(torch.tensor(losses)))
+
+    device = next(kernel_model.parameters()).device
+    if 'cpu' not in str(device):
+        kernel_model = kernel_model.to('cpu')
+        gc.collect()
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()   
+            
+    # Eval mode
+    kernel_model = kernel_model.to(device).eval()
+    for param in kernel_model.parameters():
+        param.detach_()
+
+    torch.set_float32_matmul_precision(precision_old)
+    return kernel_model 
+
 def stochastic_train_fixed(kernel_model: nn.Module,
                            data_loader: Mapping[int, dict],
                            train_params: training_params,

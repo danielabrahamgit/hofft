@@ -8,10 +8,7 @@ from typing import Optional, Union
 from einops import einsum
 from math import floor, ceil
 
-from mr_recon.utils import gen_grd, pick_K_vectors
-from mr_recon.algs import lin_solve
-from mr_recon.dtypes import complex_dtype
-
+from .utils import gen_grd, lin_solve
 from .matvec import matvec, matvec_naive
 from .phase_coeffs import rescale_phis_alphas
 
@@ -34,6 +31,7 @@ class hofft_params:
     matvec_type: matvec = matvec_naive
     matvec_kwargs: dict = field(default_factory=dict)
     spatial_init: Union[torch.Tensor, str] = 'seg'
+    spatial_batch_size: Optional[int] = None
     anderson_order: Optional[int] = None
     kalpha_method: str = 'maxmin'
     solver: str = 'pinv'
@@ -158,8 +156,11 @@ def als_iterations(phase_model: matvec,
                    spatial_factors_init: torch.Tensor,
                    mask: Optional[torch.Tensor] = None,
                    max_iter: Optional[int] = 100,
-                   solver: str = 'solve',
+                   solver: str = 'pinv',
                    lamda: float = 0.0,
+                   spatial_batch_size: Optional[int] = None,
+                   n_err_pts: Optional[int] = 1000,
+                   rel_err_tol: Optional[float] = 0.5e-2,
                    verbose: Optional[bool] = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform ALS iterations to solve for spatial factors and kernel weights.
@@ -176,6 +177,16 @@ def als_iterations(phase_model: matvec,
         image weighting mask with shape im_size
     max_iter : int, optional
         maximum number of iterations
+    solver : str, optional
+        solver for least squares
+    lamda : float, optional
+        regularization parameter for least squares
+    spatial_batch_size : int, optional
+        batch size over spatial dimension
+    n_err_pts : int, optional
+        number of error points for convergence check
+    rel_err_tol : float, optional
+        relative error tolerance for convergence check
     verbose : bool, optional
         whether to print progress
     
@@ -186,6 +197,11 @@ def als_iterations(phase_model: matvec,
     kernel_weights : torch.Tensor
         kernel weights with shape (L, K, *trj_size)
     """
+    # Consts
+    L = spatial_factors_init.shape[0]
+    K = kern_bases.shape[0]
+    N = phase_model.R
+    M = phase_model.T
         
     # Default mask
     if mask is None:
@@ -193,29 +209,38 @@ def als_iterations(phase_model: matvec,
         
     # Weights only 
     if max_iter == 0:
-        kernel_weights = lstsq_temporal(phase_model, kern_bases, spatial_factors_init, mask=mask)
+        kernel_weights = lstsq_temporal(phase_model, kern_bases, spatial_factors_init, 
+                                        mask=mask,
+                                        lamda=lamda,
+                                        solver=solver,
+                                        spatial_batch_size=spatial_batch_size)
         return spatial_factors_init, kernel_weights
     
-    # Stopping criteria
-    kwargs_allclose = {'atol': 0.0, 'rtol': 1e-3}
+    # Pick random space and time indices for error computation
+    mask_flt = mask.flatten()
+    idxs_nonz = torch.argwhere(mask_flt > 0)[:, 0]
+    idxs_space = idxs_nonz[torch.randperm(len(idxs_nonz))[:n_err_pts].to(kern_bases.device)]
+    idxs_time = torch.randperm(M)[:n_err_pts].to(kern_bases.device)
+    kern_bases_flt = kern_bases.reshape((K, -1))[:,idxs_space]
+
     
-    # Momentum term
-    # momentum = lambda k : k / (k + 3)
-    # momentum = lambda k : 0.8
+    # Momentum term (off for now, didn't seem to help)
     momentum = lambda k : 0.0
     k0 = 0
     
     # ALS till max_iter
     spatial_factors_prev = spatial_factors_init
     kernel_weights_prev = None
+    phz_est_prev = None
     tbar = tqdm(range(max_iter), 'ALS iterations', disable=not verbose)
     for k in tbar:
         
         # ALS weight updates
         kernel_weights = lstsq_temporal(phase_model, kern_bases, spatial_factors_prev, 
                                         mask=mask,
-                                        solver=solver,
                                         lamda=lamda,
+                                        solver=solver,
+                                        spatial_batch_size=spatial_batch_size,
                                         kernel_weights_prev=kernel_weights_prev)
         if k > k0:
             beta = momentum(k)
@@ -227,17 +252,25 @@ def als_iterations(phase_model: matvec,
                                         mask=mask,
                                         solver=solver,
                                         lamda=lamda,
+                                        spatial_batch_size=spatial_batch_size,
                                         spatial_factors_prev=spatial_factors_prev,)
         spatial_factors = spatial_factors.nan_to_num(0.0)
         if k > k0:
             spatial_factors = spatial_factors + beta * (spatial_factors_prev - spatial_factors)
+                    
         
-        # TODO REMOVEME
-        # Check convergence
-        if k > 0 and k % 10 == 0:
-            if torch.allclose(kernel_weights, kernel_weights_prev, **kwargs_allclose) and \
-               torch.allclose(spatial_factors, spatial_factors_prev, **kwargs_allclose):
+        # Compute phase error over subset of space and time points
+        spatial_flt = spatial_factors.reshape((L, -1))[:, idxs_space]
+        kernel_flt = kernel_weights.reshape((L, K, -1))[:, :, idxs_time]
+        phz_est = einsum(kern_bases_flt, spatial_flt, 'K N, L N -> L K N')
+        phz_est = einsum(phz_est, kernel_flt, 'L K N, L K M -> M N')
+        if k > 0:
+            rel_err = (phz_est - phz_est_prev).norm() / phz_est_prev.norm()
+            if rel_err < rel_err_tol:
+                if verbose:
+                    print(f'Converged at iteration {k} with relative phase error {rel_err*100:.2f}%')
                 break
+        phz_est_prev = phz_est
         
         # Update previous values
         kernel_weights_prev = kernel_weights
@@ -498,7 +531,7 @@ def als_compressed(spatial_bases: torch.Tensor,
     if spatial_batch_size is None:
         spatial_batch_size = N
     if mask is None:
-        mask = torch.ones((N,), dtype=complex_dtype, device=torch_dev)
+        mask = torch.ones((N,), dtype=torch.complex64, device=torch_dev)
     mask_flt = mask.flatten()
     assert mask_flt.shape[0] == N
     
@@ -627,6 +660,19 @@ def als_compressed(spatial_bases: torch.Tensor,
         
         return spatial_factors.T
 
+    # If max_iter is 0, just optimize the kernel weights
+    if max_iter == 0:
+        compressed_kernels = _lstsq_temporal(spatial_factors=spatial_factors_flt,
+                                             spatial_bases=spatial_bases_flt,
+                                             kern_bases=kern_bases_flt,
+                                             mask=mask_flt,
+                                             N_batch_size=spatial_batch_size,
+                                             solver=solver,
+                                             lamda=lamda)
+        compressed_kernels = compressed_kernels.nan_to_num(0.0)
+        spatial_factors = spatial_factors_flt.reshape((L, *im_size))
+        return spatial_factors, compressed_kernels
+
     # ALS Iterations
     spatial_factors_prev = spatial_factors_flt
     compressed_kernels_prev = None
@@ -667,13 +713,16 @@ def lstsq_spatial(phase_model: matvec,
                   kernel_weights: torch.Tensor,
                   mask: Optional[torch.Tensor] = None,
                   spatial_factors_prev: Optional[torch.Tensor] = None,
-                  k_batch_size: Optional[int] = None,
-                  t_batch_size: Optional[int] = None,
+                  spatial_batch_size: Optional[int] = None,
                   solver: Optional[str] = 'pinv',
                   lamda: Optional[float] = 0.0,) -> torch.Tensor:
     """    
     This function optimizes for the spatial factors 
     given fixed kernel weights via least squares.
+    
+    Spatial dimensions are flattened and the normal equations are assembled
+    and solved in batches of voxels to limit peak memory (important for large
+    FOVs where a full (N, L, L) solve does not fit on GPU).
     
     Args
     ----
@@ -687,10 +736,8 @@ def lstsq_spatial(phase_model: matvec,
         image weighting mask with shape im_size
     spatial_factors_prev : torch.Tensor, optional
         previous spatial factors with shape (L, *im_size)
-    k_batch_size : int, optional
-        batch size for kernel bases
-    t_batch_size : int, optional
-        batch size for temporal weights
+    spatial_batch_size : int, optional
+        number of voxels per assemble/solve batch. None uses all voxels.
     solver : str, optional
         solver for least squares
     lamda : float, optional
@@ -704,67 +751,70 @@ def lstsq_spatial(phase_model: matvec,
     # Consts
     torch_dev = kernel_weights.device
     im_size = kern_bases.shape[1:]
-    trj_size = kernel_weights.shape[2:]
-    kernel_weights_flt = rearrange(kernel_weights, 'L K ... -> L K (...)')
     L = kernel_weights.shape[0]
     K = kern_bases.shape[0]
-    T = np.prod(trj_size)
+    N = int(np.prod(im_size))
     assert phase_model.ishape == im_size
-    assert phase_model.oshape == trj_size
-    
-    # Default
-    if k_batch_size is None:
-        k_batch_size = K
-    if t_batch_size is None:
-        t_batch_size = T
+    assert phase_model.oshape == kernel_weights.shape[2:]
+
     if mask is None:
-        mask = torch.ones(im_size, dtype=complex_dtype, device=torch_dev)
-    kern_bases_masked = kern_bases * mask
-    
-    AHA = torch.zeros((*im_size, L, L), dtype=complex_dtype, device=torch_dev)
-    AHB = torch.zeros((*im_size, L), dtype=complex_dtype, device=torch_dev)
-    
-    # Build cross terms
-    cross_terms = torch.zeros((L, K, L, K), dtype=complex_dtype, device=torch_dev)
-    for t1 in range(0, T, t_batch_size):
-        t2 = min(t1 + t_batch_size, T)
-        kernel_weights_batch = kernel_weights_flt[:, :, t1:t2] # L K T
-        cross_terms += einsum(kernel_weights_batch.conj(), kernel_weights_batch, 'L1 K1 T, L2 K2 T -> L1 K1 L2 K2')
-    
-    # Build AHB and AHA matrices
-    for k1 in range(0, K, k_batch_size):
-        k2 = min(k1 + k_batch_size, K)
-        
-        # AHB
-        kernel_weights_batch = kernel_weights[:, k1:k2, ...]
-        kernel_weights_batch = rearrange(kernel_weights_batch, 'L K ... -> (L K) ...')
-        imgs_batch = phase_model.adjoint(kernel_weights_batch).reshape((L, (k2-k1), *im_size)).conj()
-        AHB += einsum(imgs_batch * mask, kern_bases_masked[k1:k2].conj(), 'L K ..., K ... -> ... L')
-        
-        # AHA   
-        kern_cross = kern_bases_masked[k1:k2, None].conj() * kern_bases_masked[None, :]
-        AHA += einsum(kern_cross, cross_terms[:, k1:k2], 'K1 K2 ..., L1 K1 L2 K2 -> ... L1 L2')
-        
-    # Solve least squares
-    if spatial_factors_prev is None:
-        spatial_factors = lin_solve(AHA, AHB[..., None], solver=solver, lamda=lamda)[..., 0] # *im_size L
-    else:
-        spatial_factors = lin_solve(AHA, (AHB + lamda * spatial_factors_prev.moveaxis(0, -1))[..., None], 
-                                    solver=solver, lamda=lamda)[..., 0] # *im_size L
-    spatial_factors = rearrange(spatial_factors, '... L -> L ...')
-    
-    return spatial_factors   
+        mask = torch.ones(im_size, dtype=torch.complex64, device=torch_dev)
+    if spatial_batch_size is None:
+        spatial_batch_size = N
+
+    # Flatten spatial dims
+    mask_flt = mask.reshape(N)
+    kern_bases_flt = (kern_bases * mask).reshape((K, N))  # K N
+    kernel_weights_flt = rearrange(kernel_weights, 'L K ... -> L K (...)')  # L K T
+    prev_flt = None
+    if spatial_factors_prev is not None:
+        prev_flt = spatial_factors_prev.reshape((L, N))
+
+    # Gram over trajectory (small: L K L K)
+    cross_terms = einsum(
+        kernel_weights_flt.conj(), kernel_weights_flt,
+        'L1 K1 T, L2 K2 T -> L1 K1 L2 K2',
+    )
+
+    # Adjoint of all (L*K) temporal weights -> (L, K, N)
+    kw_all = rearrange(kernel_weights, 'L K ... -> (L K) ...')
+    imgs_flt = phase_model.adjoint(kw_all).reshape((L, K, N)).conj()
+
+    # Assemble + solve in spatial batches
+    spatial_factors_flt = torch.empty((L, N), dtype=torch.complex64, device=torch_dev)
+    for n1 in range(0, N, spatial_batch_size):
+        n2 = min(n1 + spatial_batch_size, N)
+        kb = kern_bases_flt[:, n1:n2]            # K Nb
+        m = mask_flt[n1:n2]                      # Nb
+        imgs_b = imgs_flt[:, :, n1:n2] * m       # L K Nb
+
+        AHB = einsum(imgs_b, kb.conj(), 'L K N, K N -> N L')
+        kern_cross = kb[:, None].conj() * kb[None, :]  # K1 K2 Nb
+        AHA = einsum(kern_cross, cross_terms, 'K1 K2 N, L1 K1 L2 K2 -> N L1 L2')
+
+        if prev_flt is None:
+            rhs = AHB
+        else:
+            rhs = AHB + lamda * prev_flt[:, n1:n2].moveaxis(0, -1)
+        sol = lin_solve(AHA, rhs[..., None], solver=solver, lamda=lamda)[..., 0]  # Nb L
+        spatial_factors_flt[:, n1:n2] = sol.moveaxis(-1, 0)
+
+    return spatial_factors_flt.reshape((L, *im_size))
    
 def lstsq_temporal(phase_model: matvec, 
                    kern_bases: torch.Tensor, 
                    spatial_factors: torch.Tensor, 
                    mask: Optional[torch.Tensor] = None,
                    kernel_weights_prev: Optional[torch.Tensor] = None,
-                   lk_batch_size: Optional[int] = None,
+                   spatial_batch_size: Optional[int] = None,
                    solver: Optional[str] = 'pinv',
                    lamda: Optional[float] = 0.0,) -> torch.Tensor:
     """
     This function optimizes for the kernel weights given fixed spatial factors.
+
+    Spatial dimensions are flattened and the normal equations are accumulated
+    in batches of voxels (AHA via spatial Gram chunks; AHB via linearity of
+    ``phase_model.forward`` on spatially supported inputs).
     
     Args
     ----
@@ -778,8 +828,8 @@ def lstsq_temporal(phase_model: matvec,
         previous kernel weights with shape (L, K, *trj_size)
     mask : torch.Tensor, optional
         image weighting mask with shape im_size
-    k_batch_size : int, optional
-        batch size over combined L and K dimension
+    spatial_batch_size : int, optional
+        number of voxels per assemble batch. None uses all voxels.
     solver : str, optional
         solver for least squares
     lamda : float, optional
@@ -796,44 +846,47 @@ def lstsq_temporal(phase_model: matvec,
     torch_dev = spatial_factors.device
     im_size = kern_bases.shape[1:]
     trj_size = phase_model.oshape
+    N = int(np.prod(im_size))
+    T = int(np.prod(trj_size))
     assert phase_model.ishape == im_size
-    
-    # Default
-    if lk_batch_size is None:
-        lk_batch_size = L * K
-    if mask is None:
-        mask = torch.ones(im_size, dtype=complex_dtype, device=torch_dev)
-    
-    bases = einsum(kern_bases, spatial_factors, 'K ..., L ... -> L K ...') * mask
-    AHA = torch.zeros((L, K, L, K), dtype=kern_bases.dtype, device=kern_bases.device)
-    AHB = torch.zeros((L, K, *trj_size), dtype=kern_bases.dtype, device=kern_bases.device)
-    
-    # Inds for both l and k
-    l_inds = torch.arange(L, device=torch_dev)
-    k_inds = torch.arange(K, device=torch_dev)
-    linds, kinds = torch.meshgrid(l_inds, k_inds, indexing='ij')
-    linds = linds.flatten()
-    kinds = kinds.flatten()
-    
-    # Build AHA and AHB
-    for lk1 in range(0, L*K, lk_batch_size):
-        lk2 = min(lk1 + lk_batch_size, L*K)
-        ls = linds[lk1:lk2]
-        ks = kinds[lk1:lk2]
 
-        AHA[ls, ks] += einsum(bases[ls, ks].conj(), bases, 'lk ..., L K ... -> lk L K')
-        temp_batch = phase_model.forward(bases[ls, ks].conj() * mask) # (L K) *trj_size
-        AHB[ls, ks, ...] += temp_batch
-    
-    # Solve least squares
+    if mask is None:
+        mask = torch.ones(im_size, dtype=torch.complex64, device=torch_dev)
+    if spatial_batch_size is None:
+        spatial_batch_size = N
+
+    # Flatten spatial dims
+    kern_flt = kern_bases.reshape((K, N))
+    spat_flt = spatial_factors.reshape((L, N))
+    mask_flt = mask.reshape(N)
+
+    AHA = torch.zeros((L, K, L, K), dtype=torch.complex64, device=torch_dev)
+    AHB = torch.zeros((L * K, T), dtype=torch.complex64, device=torch_dev)
+    # Reused forward input: only one spatial slab is nonzero per batch
+    x = torch.zeros((L * K, *im_size), dtype=torch.complex64, device=torch_dev)
+    x_flt = x.reshape((L * K, N))
+
+    for n1 in range(0, N, spatial_batch_size):
+        n2 = min(n1 + spatial_batch_size, N)
+        m = mask_flt[n1:n2]
+        # bases = spatial_factors * kern_bases * mask  (same as before)
+        b = spat_flt[:, None, n1:n2] * kern_flt[None, :, n1:n2] * m  # L K Nb
+
+        AHA += einsum(b.conj(), b, 'L1 K1 N, L2 K2 N -> L1 K1 L2 K2')
+
+        # AHB += Phi @ (conj(bases) * mask), via spatial support of this slab
+        x_flt.zero_()
+        x_flt[:, n1:n2] = rearrange(b.conj() * m, 'L K N -> (L K) N')
+        AHB += phase_model.forward(x).reshape((L * K, T))
+
+    # Solve least squares on the small (L*K, L*K) system
     AHA_flt = rearrange(AHA, 'L1 K1 L2 K2 -> (L1 K1) (L2 K2)')
-    AHB_flt = rearrange(AHB, 'L K ... -> (L K) (...)')
     if kernel_weights_prev is None:
-        kernel_weights_flt = lin_solve(AHA_flt, AHB_flt, solver=solver, lamda=lamda) # (L K) (...)
+        kernel_weights_flt = lin_solve(AHA_flt, AHB, solver=solver, lamda=lamda)
     else:
         kernel_weights_prev_flt = rearrange(kernel_weights_prev, 'L K ... -> (L K) (...)')
-        kernel_weights_flt = lin_solve(AHA_flt, AHB_flt + lamda * kernel_weights_prev_flt, 
-                                       solver=solver, lamda=lamda) # (L K) (...)
-    kernel_weights = kernel_weights_flt.reshape(AHB.shape)
-        
-    return kernel_weights
+        kernel_weights_flt = lin_solve(
+            AHA_flt, AHB + lamda * kernel_weights_prev_flt,
+            solver=solver, lamda=lamda,
+        )
+    return kernel_weights_flt.reshape((L, K, *trj_size))

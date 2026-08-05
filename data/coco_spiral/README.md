@@ -1,6 +1,5 @@
 # Data Docs
 
-## Purpose
 We performed a corronal (X-Z) plane R3 0.8mm resolution 22cm FOV spiral acquisition on a water/plastic phantom, which is sensitive to high order conocmitant fields.Tthis dataset was collected on our [3T GE MRI scanner](https://cni.su.domains/wiki/index.php?title=MR_Scanner). 
 
 ## Explanations of Saved Tensors

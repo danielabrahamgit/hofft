@@ -1,30 +1,39 @@
+import copy
 import torch
 import numpy as np
 
 from typing import Optional, Union
 from einops import einsum
 
-from mr_recon.imperfections.field import b0_to_phis_alphas, alpha_segementation
-from mr_recon.utils import gen_grd, resize
-from mr_recon.linops import linop, batching_params
-from mr_recon.spatial import spatial_resize_poly, spatial_interp
+from mr_recon.imperfections.field import b0_to_phis_alphas
+from mr_recon.linops import linop, sense_linop, batching_params
 from mr_recon.algs import eigen_decomp_operator
 from mr_recon.fourier import sigpy_nufft, fft, ifft
 
+from .matvec import matvec_naive
+
+from .phase_coeffs import (trj_dev_to_phis_alphas, 
+                           rescale_phis_alphas,
+                           apply_phase_midpoints,
+                           whiten_phis_alphas
+)
 from .decomp import (
     hofft_params, 
     als_iterations, 
     build_kern_bases, 
-    als_anderson_iterations,
-    als_compressed,
-    als_iterations_tempinit,
+    als_anderson_iterations
 )
-from .spatial_init import choose_init
-from .sgd import train_net_apod
+from .utils import gen_grd, resize, spatial_interp, reduce_spatial, expand_spatial
+from .spatial_init import choose_init, K_alphas_init
+from .sgd import train_sparse_net, training_params
 from .kb import kb_apod_1d, sample_kb_kernel
-from .forward_model import hofft_linop
-from .reduce import expand_temporal, reduce_temporal, alpha_interp_kerns, reduce_params, expand_spatial
-from .sparse_decomp import sparse_params, sparse_alpha_segmentation
+from .forward_model import hofft_linop, hofft_compressed_linop
+from .sparse_fit import (
+    sparse_params,
+    lstsq_compressed_fixed_support,
+    smooth_sparse_coeffs,
+    sweep_smooth_interp_hyperparams,
+)
 
 def kb_nufft(trj: torch.Tensor,
              im_size: tuple,
@@ -164,6 +173,90 @@ def mlp_hofft(phis: torch.Tensor,
     
     return weights, apods, kern_model
 
+def mlp_hofft_compressed(phis: torch.Tensor,
+                         alphas: torch.Tensor,
+                         hparams: hofft_params,
+                         sparams: sparse_params,
+                         tparams: training_params = training_params(),
+                         spatial_mask: Optional[torch.Tensor] = None,) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Learns compressed HOFFT kernels using a sparse MLP
+    
+    Args
+    ----
+    phis : torch.Tensor
+        Spatial phase maps with shape (B, *solve_size)
+    alphas : torch.Tensor
+        Temporal phase coefficients with shape (B, *trj_size)
+    hparams : hofft_params
+        HOFFT parameters.
+    sparams : sparse_params
+        Sparse decomposition parameters.
+    spatial_mask : Optional[torch.Tensor]
+        Spatial mask with shape (*im_size)
+    num_als_iter : int
+        Number of ALS iterations.
+    
+    Returns
+    -------
+    spatial_factors : torch.Tensor
+        Spatial factors with shape (L, *im_size)
+    compressed_kernels : torch.Tensor
+        Compressed kernel dictionary with shape (L, *kern_size, Q)
+    bias_kern : torch.Tensor
+        Bias kernel with shape (L, *kern_size)
+    sparse_inds : torch.Tensor
+        Sparse indices (long) with shape (S, *trj_size), values in [0, Q)
+    sparse_coeffs : torch.Tensor
+        Sparse coefficients (real softmax weights, cast to complex64) with shape (S, *trj_size)
+    """
+    # Consts
+    im_size = phis.shape[1:]
+    torch_dev = phis.device
+    kern_size = hparams.kern_size
+    os = hparams.os
+    L = hparams.L
+    spatial_init = hparams.spatial_init
+    verbose = hparams.verbose
+    reduced_im_size = hparams.reduced_im_size
+    Q = sparams.Q
+    S = sparams.S
+
+    # Default spatial mask
+    if spatial_mask is None:
+        spatial_mask = torch.ones(im_size, dtype=torch.complex64, device=torch_dev)
+    
+    # Reduce phi size
+    if reduced_im_size is not None:
+        phis_reduced = spatial_resize_poly(phis, 
+                                           im_size=reduced_im_size, 
+                                           order=3)
+        spatial_mask = spatial_resize_poly(spatial_mask, 
+                                           im_size=reduced_im_size, 
+                                           order=3)
+    else:
+        phis_reduced = phis
+    
+    # Initialize spatial factors
+    spatial_factors = choose_init(phis_reduced, alphas, 
+                                  hparams=hparams, 
+                                  spatial_mask=spatial_mask,
+                                  spatial_init=spatial_init)
+    
+    # Train sparse MLP
+    ret = train_sparse_net(phis_reduced, alphas, 
+                           spatial_factors_init=spatial_factors, 
+                           hparams=hparams, sparams=sparams, tparams=tparams, 
+                           opt_spatial_factors=False,
+                           spatial_mask=spatial_mask)
+    spatial_factors, compressed_kernels, bias_kern, sparse_inds, sparse_coeffs = ret
+    
+    # Expand spatial factors
+    spatial_factors = expand_spatial(spatial_factors, 
+                                     im_size_high=im_size, 
+                                     order=3)
+    return spatial_factors, compressed_kernels, bias_kern, sparse_inds, sparse_coeffs
+    
 def als_nufft(trj: torch.Tensor,
               im_size: tuple,
               hparams: hofft_params,
@@ -253,11 +346,11 @@ def als_nufft(trj: torch.Tensor,
     
     # Perform ALS iterations
     if hparams.anderson_order is None: 
-        kern_weights, spatial_factor = als_iterations(phase_model, kern_bases, spatial_factor, 
+        spatial_factor, kern_weights = als_iterations(phase_model, kern_bases, spatial_factor, 
                                                       mask=spatial_mask,
                                                       max_iter=num_als_iter, verbose=verbose)
     else:
-        kern_weights, spatial_factor = als_anderson_iterations(phase_model, kern_bases, spatial_factor, 
+        spatial_factor, kern_weights = als_anderson_iterations(phase_model, kern_bases, spatial_factor, 
                                                                anderson_order=hparams.anderson_order,
                                                                mask=spatial_mask,
                                                                max_iter=num_als_iter, verbose=verbose)
@@ -276,10 +369,238 @@ def als_nufft(trj: torch.Tensor,
     
     return spatial_factor, kern_weights
 
+def time_seg_decomp_linop(phis: torch.Tensor,
+                          alphas: torch.Tensor,
+                          mps: torch.Tensor,
+                          trj: torch.Tensor,
+                          hparams: hofft_params,
+                          spatial_mask: Optional[torch.Tensor] = None,
+                          dcf: Optional[torch.Tensor] = None,
+                          bparams: batching_params = batching_params(),
+                          normalize_coeffs: bool = False,
+                          use_sigpy: bool = False) -> linop:
+    """
+    Time-segmented NUFFT decomposition and linop.
+    
+    Args
+    ----
+    phis : torch.Tensor
+        Spatial phase maps with shape (B, *im_size)
+    alphas : torch.Tensor
+        Temporal phase coefficients with shape (B, *trj_size)
+    mps : torch.Tensor
+        Coil sensitivities with shape (C, *im_size)
+    trj : torch.Tensor
+        k-space trajectory with shape (*trj_size, d)
+    hparams : hofft_params
+        HOFFT parameters.
+    spatial_mask : Optional[torch.Tensor]
+        Spatial mask with shape (*im_size)
+    dcf : Optional[torch.Tensor]
+        Density compensation factor with shape (*trj_size)
+    bparams : batching_params
+        Batching parameters for the HOFFT linop.
+    normalize_coeffs : bool
+        Whether to normalize the phase coefficients.
+    
+    Returns
+    -------
+    linop : linop
+        Time-segmented NUFFT decomposition and linop.
+    """
+    # Consts
+    B = phis.shape[0]
+    im_size = phis.shape[1:]
+    trj_size = trj.shape[:-1]
+    d = len(im_size)
+    torch_dev = phis.device
+    kern_size = hparams.kern_size
+    os = hparams.os
+    
+    # Make sure the kernel size is isotropic
+    for i in range(1, d):
+        assert kern_size[0] == kern_size[i], "Kernel size must be isotropic for time-segmented NUFFT decomposition"
+    
+    # Normalize phase coefficients
+    if normalize_coeffs:
+        phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis, alphas)
+        spat, temp = apply_phase_midpoints(phis_nrm, alphas_nrm, phis_mp, alphas_mp)
+        phis_nrm, alphas_nrm = whiten_phis_alphas(phis_nrm, alphas_nrm, 
+                                                  B_compressed=B)
+    else:
+        phis_nrm = phis
+        alphas_nrm = alphas
+        phis_mp = torch.zeros(B, device=torch_dev, dtype=torch.float32)
+        alphas_mp = torch.zeros(B, device=torch_dev, dtype=torch.float32)
+        spat = torch.ones_like(phis_nrm[0]).type(torch.complex64)
+        temp = torch.ones_like(alphas_nrm[0]).type(torch.complex64)
+    
+    
+    # Single temporal least squares solve, num_als_iter=0 does exactly that
+    hparams_copy = copy.copy(hparams)
+    hparams_copy.spatial_init = 'seg' # time seg
+    hparams_copy.kern_size = (1,)*d
+    num_als_iter = 0
+    spatial_funcs, temporal_funcs = als_hofft(phis_nrm, alphas_nrm, hparams_copy, 
+                                              spatial_mask=spatial_mask, 
+                                              num_als_iter=num_als_iter)
+    
+    # Get optimal beta parameter
+    nft = sigpy_nufft(im_size, oversamp=os, width=kern_size[0])
+    nft.beta = nft.optimal_beta(torch_dev=torch_dev)
+    
+    # Use Sigpy's KB NUFFT framework for forward model
+    if use_sigpy:
+        temporal_funcs = temporal_funcs.reshape((hparams.L, *alphas_nrm.shape[1:]))
+        A = sense_linop(trj, mps, dcf, nufft=nft, 
+                        spatial_funcs=spatial_funcs * spat,
+                        temporal_funcs=temporal_funcs * temp,
+                        bparams=bparams)
+    # Use HOFFT forward model with KB NUFFT weights
+    else:
+        # Calculate KB NUFFT weights
+        spatial_factor, kern_weights = kb_nufft(trj, im_size, kern_size, 
+                                                os=os, beta=nft.beta)
+        
+        # Combine
+        spatial_factors = spatial_factor * spatial_funcs * spat
+        kern_weights = kern_weights * temporal_funcs * temp
+        
+        # Build linop
+        trj_grd = (os * trj).round()/os
+        A = hofft_linop(trj=trj_grd, mps=mps, dcf=dcf, 
+                        kern_weights=kern_weights, 
+                        spatial_factors=spatial_factors, 
+                        os_grid=os, bparams=bparams)
+    
+    return A
+
+def hofft_decomp_linop(phis: torch.Tensor,
+                       alphas: torch.Tensor,
+                       mps: torch.Tensor,
+                       trj: torch.Tensor,
+                       hparams: hofft_params,
+                       B_compressed: Optional[int] = None,
+                       normalize_coeffs: bool = True,
+                       sparams: Optional[sparse_params] = None,
+                       num_als_iter: int = 100,
+                       spatial_mask: Optional[torch.Tensor] = None,
+                       dcf: Optional[torch.Tensor] = None,
+                       bparams: batching_params = batching_params()) -> linop:
+    """
+    Performs HOFFT decomposition using ALS and builds the HOFFT linop.
+    
+    Args
+    ----
+    phis : torch.Tensor
+        Spatial phase maps with shape (B, *im_size)
+    alphas : torch.Tensor
+        Temporal phase coefficients with shape (B, *trj_size)
+    mps : torch.Tensor
+        coil sensitivities with shape (C, *im_size)
+    trj : torch.Tensor
+        k-space trajectory with shape (*trj_size, d)
+    hparams : hofft_params
+        HOFFT parameters.
+    B_compressed : Optional[int]
+        Number of compressed field bases to reduce computation
+    normalize_coeffs : bool
+        Whether to normalize the phase coefficients.
+    sparams : Optional[sparse_params]
+        Sparse decomposition parameters. If None, uses the full HOFFT forward model (memory intensive).
+    num_als_iter : int
+        Number of ALS iterations.
+    spatial_mask : Optional[torch.Tensor]
+        Spatial mask with shape (*im_size)
+    dcf : Optional[torch.Tensor]
+        density compensation factor with shape (*trj_size)
+    bparams : batching_params
+        Batching parameters for the HOFFT linop.
+        
+    Returns
+    -------
+    linop : linop
+        HOFFT linop taking in an image and returning k-space data
+    """
+    # Consts
+    B = phis.shape[0]
+    im_size = phis.shape[1:]
+    d = len(im_size)
+    os = hparams.os
+    torch_dev = phis.device
+    
+    # ----------------- Process phase coefficients -----------------
+    # Combine grid deviation phase to high order phase coefficients
+    phis_dev, alphas_dev = trj_dev_to_phis_alphas(trj, im_size, os)
+    trj_grd = (trj * os).round() / os
+    phis_stack = torch.cat([phis_dev, phis], dim=0)
+    alphas_stack = torch.cat([alphas_dev, alphas], dim=0)
+    
+    # Normalize phase coefficients
+    if normalize_coeffs:
+        phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis_stack, alphas_stack)
+        spat, temp = apply_phase_midpoints(phis_nrm, alphas_nrm, phis_mp, alphas_mp)
+        if B_compressed is None:
+            B_compressed = B + d
+        else:
+            assert B_compressed <= B + d, "B_compressed must be less or equal to B + d"
+        phis_nrm, alphas_nrm = whiten_phis_alphas(phis_nrm, alphas_nrm, 
+                                                  B_compressed=B_compressed)
+    else:
+        phis_nrm = phis_stack
+        alphas_nrm = alphas_stack
+        phis_mp = torch.zeros(B, device=torch_dev, dtype=torch.float32)
+        alphas_mp = torch.zeros(B, device=torch_dev, dtype=torch.float32)
+        spat = torch.ones_like(phis_nrm[0]).type(torch.complex64)
+        temp = torch.ones_like(alphas_nrm[0]).type(torch.complex64)
+    
+    # ----------------- HOFFT Decomposition -----------------
+    
+    # Full HOFFT Decomposition
+    if sparams is None:
+        spatial_factors, kern_weights = als_hofft(phis_nrm, alphas_nrm,
+                                                  spatial_mask=spatial_mask,
+                                                  hparams=hparams,
+                                                  num_als_iter=num_als_iter)
+        spatial_factors *= spat
+        kern_weights *= temp
+        A = hofft_linop(trj=trj_grd, mps=mps, dcf=dcf, 
+                        kern_weights=kern_weights, 
+                        spatial_factors=spatial_factors, 
+                        os_grid=os, bparams=bparams)
+    # Sparse HOFFT Decomposition
+    else:
+        # Least squares optimal sparse decomposition
+        if sparams.interp_type == 'lstsq':
+            ret = als_hofft_sparse_lstsq(phis_nrm, alphas_nrm, 
+                                         spatial_mask=spatial_mask,
+                                         hparams=hparams, 
+                                         sparams=sparams, 
+                                         num_als_iter=num_als_iter)
+        # Smooth sparse decomposition
+        else:
+            ret = als_hofft_sparse_smooth(phis_nrm, alphas_nrm, 
+                                          spatial_mask=spatial_mask,
+                                          hparams=hparams, 
+                                          sparams=sparams, 
+                                          num_als_iter=num_als_iter)
+            
+        # Build sparse linop
+        spatial_factors, compressed_kernels, sparse_idxs, sparse_coeffs = ret
+        spatial_factors *= spat
+        A = hofft_compressed_linop(trj=trj_grd, mps=mps, dcf=dcf,
+                                   compressed_kernels=compressed_kernels,
+                                   sparse_idxs=sparse_idxs,
+                                   sparse_coeffs=sparse_coeffs,
+                                   spatial_factors=spatial_factors,
+                                   temporal_factors=temp,
+                                   os_grid=os, bparams=bparams)
+    
+    return A
+
 def als_hofft(phis: torch.Tensor,
               alphas: torch.Tensor,
               hparams: hofft_params,
-              rparams: Optional[reduce_params] = reduce_params(),
               spatial_mask: Optional[torch.Tensor] = None,
               num_als_iter: int = 100) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -315,48 +636,42 @@ def als_hofft(phis: torch.Tensor,
     L = hparams.L
     spatial_init = hparams.spatial_init
     verbose = hparams.verbose
+    spatial_reduce_size = hparams.reduced_im_size
+    solver = hparams.solver
+    lamda = hparams.lamda
+    spatial_batch_size = hparams.spatial_batch_size
     
     # Default spatial mask
     if spatial_mask is None:
         spatial_mask = torch.ones(im_size, dtype=torch.complex64, device=torch_dev)
     
     # Reduce phi size
-    if rparams.spatial_reduce_size is not None:
-        phis_reduced = spatial_resize_poly(phis, 
-                                           im_size=rparams.spatial_reduce_size, 
-                                           order=rparams.spatial_reduce_order)
+    if spatial_reduce_size is not None:
+        phis_reduced = reduce_spatial(phis, 
+                                      im_size_low=spatial_reduce_size, 
+                                      order=3)
+        # kern_bases = build_kern_bases(kern_size, 
+        #                               im_size=spatial_reduce_size, 
+        #                               os=os).to(torch_dev)
         kern_bases = build_kern_bases(kern_size, 
-                                      im_size=rparams.spatial_reduce_size, 
+                                      im_size=im_size, 
                                       os=os).to(torch_dev)
-        spatial_mask = spatial_resize_poly(spatial_mask, 
-                                           im_size=rparams.spatial_reduce_size, 
-                                           order=rparams.spatial_reduce_order)
+        kern_bases = reduce_spatial(kern_bases, 
+                                    im_size_low=spatial_reduce_size, 
+                                    order=3)
+        spatial_mask = reduce_spatial(spatial_mask, 
+                                      im_size_low=spatial_reduce_size, 
+                                      order=3)
     else:
         kern_bases = build_kern_bases(kern_size, im_size, os).to(torch_dev)
         phis_reduced = phis
     
-    # Reduce alpha size
-    if rparams.alpha_reduce_width is not None:
-        ret = alpha_interp_kerns(phis_reduced, 
-                                 W=rparams.alpha_reduce_width, 
-                                 dalphas=rparams.alpha_reduce_grid_spacing, 
-                                 solve_apod=rparams.alpha_reduce_use_apod)
-        weights, delta_alphas, apods = ret
-        ret = reduce_temporal(alphas, 
-                              W=rparams.alpha_reduce_width, 
-                              dalphas=rparams.alpha_reduce_grid_spacing)
-        alphas_reduced, alpha_kern, alpha_to_unq_idx = ret
-        alphas_reduced = alphas_reduced.T
-        print(alphas.numel() / alphas_reduced.numel())
-    else:
-        alphas_reduced = alphas
-    
     # Make matvec phase model
-    phase_model = hparams.matvec_type(phis_reduced, alphas_reduced, 
+    phase_model = hparams.matvec_type(phis_reduced, alphas, 
                                       **hparams.matvec_kwargs)
     
     # Initialize spatial factors
-    spatial_factors = choose_init(phis_reduced, alphas_reduced, 
+    spatial_factors = choose_init(phis_reduced, alphas, 
                                   hparams=hparams, 
                                   spatial_mask=spatial_mask,
                                   spatial_init=spatial_init)
@@ -366,182 +681,35 @@ def als_hofft(phis: torch.Tensor,
         spatial_factors, kern_weights = als_iterations(phase_model, kern_bases, spatial_factors,
                                                        mask=spatial_mask,
                                                        max_iter=num_als_iter, 
+                                                       solver=solver,
+                                                       lamda=lamda,
+                                                       spatial_batch_size=spatial_batch_size,
                                                        verbose=verbose)
     else:
         spatial_factors, kern_weights = als_anderson_iterations(phase_model, kern_bases, spatial_factors, 
                                                                 anderson_order=hparams.anderson_order,
                                                                 mask=spatial_mask,
+                                                                solver=solver,
+                                                                lamda=lamda,
                                                                 max_iter=num_als_iter, verbose=verbose)
-    kern_weights = kern_weights.reshape((L, *kern_size, *alphas_reduced.shape[1:]))
+    kern_weights = kern_weights.reshape((L, *kern_size, *alphas.shape[1:]))
 
     # Expand phis 
-    if rparams.spatial_reduce_size is not None:
+    if spatial_reduce_size is not None:
         spatial_factors = expand_spatial(spatial_factors, 
                                          im_size_high=im_size,
-                                         order=rparams.spatial_reduce_order)
-    
-    # Expand alphas
-    if rparams.alpha_reduce_width is not None:
-        kern_weights = expand_temporal(kern_weights, alphas, 
-                                       dalphas=rparams.alpha_reduce_grid_spacing,
-                                       weights=weights,
-                                       delta_alphas=delta_alphas,
-                                       alpha_kern=alpha_kern,
-                                       alpha_to_unq_idx=alpha_to_unq_idx,
-                                       temporal_batch_size=rparams.alpha_interp_batch_size)
-        apods = expand_spatial(apods,
-                               im_size_high=im_size,
-                               order=rparams.spatial_reduce_order)
-        spatial_factors *= apods.prod(dim=0)
+                                         order=3)
     
     return spatial_factors, kern_weights
 
-def als_hofft_kbinit(phis: torch.Tensor,
-                     alphas: torch.Tensor,
-                     trj: torch.Tensor,
-                     hparams: hofft_params,
-                     rparams: Optional[reduce_params] = reduce_params(),
-                     spatial_mask: Optional[torch.Tensor] = None,
-                     num_als_iter: int = 100) -> tuple[torch.Tensor, torch.Tensor]:
+def als_hofft_sparse_lstsq(phis: torch.Tensor,
+                           alphas: torch.Tensor,
+                           hparams: hofft_params,
+                           sparams: sparse_params,
+                           spatial_mask: Optional[torch.Tensor] = None,
+                           num_als_iter: int = 100) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    General pipeline for getting a HOFFT linop using ALS with a splitting model 
-    for the spatio-temporal phase.
-    
-    Args
-    ----
-    phis : torch.Tensor
-        High order spatial phase maps with shape (B, *im_size)
-    alphas : torch.Tensor
-        High order temporal phase coefficients with shape (B, *trj_size)
-    trj : torch.Tensor
-        Non-Cartesian trajectory with shape (*trj_size, d)
-    hparams : hofft_params
-        HOFFT parameters.
-    Q : int
-        Number of spatial basis functions.
-    rparams : Optional[reduce_params]
-        Parameters specifying how to reduce the spatial (phi) and temporal (alpha) dimensions
-    spatial_mask : Optional[torch.Tensor]
-        Spatial mask with shape (*im_size)
-    num_als_iter : Optional[int]
-        Number of ALS iterations.
-        
-    Returns
-    -------
-    spatial_factor : torch.Tensor
-        Spatial factors with shape (L, *im_size)
-    kern_weights : torch.Tensor
-        NUFFT kernel weights with shape (L, *kern_size, *trj_size)
-    """
-    # Consts
-    im_size = phis.shape[1:]
-    torch_dev = phis.device
-    kern_size = hparams.kern_size
-    os = hparams.os
-    L = hparams.L
-    K = np.prod(kern_size)
-    trj_size = trj.shape[:-1]
-    spatial_init = hparams.spatial_init
-    verbose = hparams.verbose
-    
-    # Default spatial mask
-    if spatial_mask is None:
-        spatial_mask = torch.ones(im_size, dtype=torch.complex64, device=torch_dev)
-    
-    # Reduce phi size
-    if rparams.spatial_reduce_size is not None:
-        phis_reduced = spatial_resize_poly(phis, 
-                                           im_size=rparams.spatial_reduce_size, 
-                                           order=rparams.spatial_reduce_order)
-        kern_bases = build_kern_bases(kern_size, 
-                                      im_size=rparams.spatial_reduce_size, 
-                                      os=os).to(torch_dev)
-        spatial_mask = spatial_resize_poly(spatial_mask, 
-                                           im_size=rparams.spatial_reduce_size, 
-                                           order=rparams.spatial_reduce_order)
-    else:
-        kern_bases = build_kern_bases(kern_size, im_size, os).to(torch_dev)
-        phis_reduced = phis
-    
-    # Reduce alpha size
-    if rparams.alpha_reduce_width is not None:
-        ret = alpha_interp_kerns(phis_reduced, 
-                                 W=rparams.alpha_reduce_width, 
-                                 dalphas=rparams.alpha_reduce_grid_spacing, 
-                                 solve_apod=rparams.alpha_reduce_use_apod)
-        weights, delta_alphas, apods = ret
-        ret = reduce_temporal(alphas, 
-                              W=rparams.alpha_reduce_width, 
-                              dalphas=rparams.alpha_reduce_grid_spacing)
-        alphas_reduced, alpha_kern, alpha_to_unq_idx = ret
-        alphas_reduced = alphas_reduced.T
-        print(alphas.numel() / alphas_reduced.numel())
-    else:
-        alphas_reduced = alphas
-        
-    # Make matvec phase model
-    phase_model = hparams.matvec_type(phis_reduced, alphas_reduced, 
-                                      **hparams.matvec_kwargs)
-    # Initialize spatial factors
-    spatial_factors = choose_init(phis_reduced, alphas_reduced, 
-                                  hparams=hparams, 
-                                  spatial_mask=spatial_mask,
-                                  spatial_init=spatial_init)
-
-    # Solve high order splitting coeffs
-    from mr_recon.imperfections.field import phi_alpha_svd, alpha_segementation
-    bs, cs, _ = alpha_segementation(phis_reduced, alphas_reduced, 
-                                    L=L, interp_type='lstsq', use_type3=False,
-                                    manual_spatial_funcs=spatial_factors,
-                                    verbose=verbose)
-    
-    # Initialize kernel weights via KB
-    from mr_recon.fourier import sigpy_nufft
-    nft = sigpy_nufft(im_size, oversamp=os, width=kern_size[0])
-    beta = nft.optimal_beta(torch_dev=torch_dev)
-    apod, kb_weights = kb_nufft(trj, im_size, kern_size,
-                                os=os, beta=beta)
-    kb_weights = kb_weights.reshape((1, K, *trj_size))
-    kern_weights_init = kb_weights * cs[:, None, ...]
-    
-    # HOFFT decomp with kernel weights initialized via KB
-    spatial_factors, kern_weights = als_iterations_tempinit(phase_model, kern_bases, kern_weights_init,
-                                                            mask=spatial_mask,
-                                                            max_iter=num_als_iter, verbose=verbose)
-    kern_weights = kern_weights.reshape((L, *kern_size, *alphas_reduced.shape[1:]))
-
-    # Expand phis 
-    if rparams.spatial_reduce_size is not None:
-        spatial_factors = expand_spatial(spatial_factors, 
-                                         im_size_high=im_size,
-                                         order=rparams.spatial_reduce_order)
-    
-    # Expand alphas
-    if rparams.alpha_reduce_width is not None:
-        kern_weights = expand_temporal(kern_weights, alphas, 
-                                       dalphas=rparams.alpha_reduce_grid_spacing,
-                                       weights=weights,
-                                       delta_alphas=delta_alphas,
-                                       alpha_kern=alpha_kern,
-                                       alpha_to_unq_idx=alpha_to_unq_idx,
-                                       temporal_batch_size=rparams.alpha_interp_batch_size)
-        apods = expand_spatial(apods,
-                               im_size_high=im_size,
-                               order=rparams.spatial_reduce_order)
-        spatial_factors *= apods.prod(dim=0)
-    
-    return spatial_factors, kern_weights
-
-def als_hofft_compressed(phis: torch.Tensor,
-                         alphas: torch.Tensor,
-                         hparams: hofft_params,
-                         sparams: sparse_params,
-                         spatial_mask: Optional[torch.Tensor] = None,
-                         num_als_iter: int = 100,
-                         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    General pipeline for getting a HOFFT linop using ALS with a compression model 
-    for the spatio-temporal phase.
+    Finds least squares optimal interpolation coefficients for the sparse HOFFT kernels.
     
     Args
     ----
@@ -555,83 +723,217 @@ def als_hofft_compressed(phis: torch.Tensor,
         Sparse decomposition parameters.
     spatial_mask : Optional[torch.Tensor]
         Spatial mask with shape (*im_size)
-    num_als_iter : Optional[int]
+    num_als_iter : int
         Number of ALS iterations.
-    return_compressed : bool
-        Whether to return the compressed kernels.
         
     Returns
     -------
-    spatial_factor : torch.Tensor
+    spatial_factors : torch.Tensor
         Spatial factors with shape (L, *im_size)
-    kern_weights : torch.Tensor
-        NUFFT kernel weights with shape (L, *kern_size, *trj_size)
-    sparse_inds : torch.Tensor
-        Sparse indices with shape (K, *trj_size) in [0, Q)
+    compressed_kernels : torch.Tensor
+        Compressed HOFFT kernels with shape (L, *kern_size, Q)
+    sparse_idxs : torch.Tensor
+        Sparse indices with shape (S, *trj_size) in [0, Q)
     sparse_coeffs : torch.Tensor
-        Sparse coefficients with shape (K, *trj_size)
+        Sparse coefficients with shape (S, *trj_size)
     """
-    # Consts
     im_size = phis.shape[1:]
     torch_dev = phis.device
     kern_size = hparams.kern_size
     os = hparams.os
-    L = hparams.L
-    spatial_init = hparams.spatial_init
     verbose = hparams.verbose
     reduced_im_size = hparams.reduced_im_size
     Q = sparams.Q
-    K = sparams.K
+    S = sparams.S
+    lamda = sparams.lamda
+    spatial_subsample = sparams.spatial_subsample
+    temporal_batch_size = sparams.temporal_batch_size
     
     # Default spatial mask
     if spatial_mask is None:
         spatial_mask = torch.ones(im_size, dtype=torch.complex64, device=torch_dev)
-    
-    # Reduce phi size
+
     if reduced_im_size is not None:
-        phis_reduced = spatial_resize_poly(phis, 
-                                           im_size=reduced_im_size, 
-                                           order=3)
-        kern_bases = build_kern_bases(kern_size, 
-                                      reduced_im_size, 
-                                      os=os).to(torch_dev)
-        spatial_mask = spatial_resize_poly(spatial_mask, 
-                                           im_size=reduced_im_size, 
-                                           order=3)
+        phis_reduced = reduce_spatial(phis, im_size_low=reduced_im_size, order=3)
+        kern_bases = build_kern_bases(kern_size, reduced_im_size, os=os).to(torch_dev)
+        # kern_bases = build_kern_bases(kern_size, im_size, os=os).to(torch_dev)
+        # kern_bases = reduce_spatial(kern_bases, im_size_low=reduced_im_size, order=3)
+        spatial_mask_red = reduce_spatial(spatial_mask, im_size_low=reduced_im_size, order=3)
     else:
-        kern_bases = build_kern_bases(kern_size, im_size, os).to(torch_dev)
         phis_reduced = phis
-    
-    # Initialize spatial factors
-    spatial_factors = choose_init(phis_reduced, alphas, 
-                                  hparams=hparams, 
-                                  spatial_mask=spatial_mask,
-                                  spatial_init=spatial_init)
+        kern_bases = build_kern_bases(kern_size, im_size, os=os).to(torch_dev)
+        spatial_mask_red = spatial_mask
 
-    # Apply splitting decomp
-    sparse_rets = sparse_alpha_segmentation(phis_reduced, alphas, sparams,
-                                            verbose=verbose)
-    spatial_bases, sparse_inds, sparse_coeffs = sparse_rets
-    Q = spatial_bases.shape[0] # may differ from sparams.Q for grid methods
-    
-    # HOFFT decomp on split bases
-    spatial_factors, compressed_kernels = als_compressed(spatial_bases=spatial_bases,
-                                                         kern_bases=kern_bases, 
-                                                         spatial_factors_init=spatial_factors,
-                                                         spatial_batch_size=sparams.spatial_batch_size,
-                                                         mask=spatial_mask,
-                                                         max_iter=num_als_iter,
-                                                         lamda=hparams.lamda,
-                                                         solver=hparams.solver,
-                                                         verbose=verbose)
-    compressed_kernels = compressed_kernels.reshape((L, *kern_size, Q))
+    spatial_factors, compressed_kernels, betas = K_alphas_init(
+        phis_reduced, alphas,
+        hparams=hparams,
+        spatial_mask=spatial_mask_red,
+        spatial_init_method='seg',
+        num_als_iter=num_als_iter,
+        K=Q,
+        return_kernels=True,
+    )
 
+    sparse_inds, sparse_coeffs = lstsq_compressed_fixed_support(
+        phis_reduced, alphas,
+        spatial_factors=spatial_factors,
+        compressed_kernels=compressed_kernels,
+        kern_bases=kern_bases,
+        betas=betas,
+        sparsity=S,
+        hparams=hparams,
+        spatial_mask=spatial_mask_red,
+        spatial_subsample=spatial_subsample,
+        temporal_batch_size=temporal_batch_size,
+        lamda=lamda,
+        verbose=verbose,
+    )
+    
+    # Reshape
+    sparse_coeffs = sparse_coeffs.moveaxis(-1, 0)
+    sparse_inds = sparse_inds.moveaxis(-1, 0)
+
+    if reduced_im_size is not None:
+        spatial_factors = expand_spatial(spatial_factors, im_size_high=im_size, order=3)
+
+    return spatial_factors, compressed_kernels, sparse_inds, sparse_coeffs
+
+def als_hofft_sparse_smooth(phis: torch.Tensor,
+                            alphas: torch.Tensor,
+                            hparams: hofft_params,
+                            sparams: sparse_params,
+                            spatial_mask: Optional[torch.Tensor] = None,
+                            num_als_iter: int = 100,
+                            d: float = 1.0,
+                            p: float = 2.0,
+                            eps: float = 1e-3,
+                            d_grid: torch.Tensor = torch.logspace(-1, 0.7, 10),
+                            p_grid: torch.Tensor = torch.linspace(1, 8.0, 8)
+                            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Strategy 2.5 (see math_docs/sparse_fit.md): k_alphas ``H_comp`` + smooth
+    distance-based sparse interpolation for ``C``.
+
+    Same compressed kernels as ``sparse_fit_hofft_omp`` / ``sparse_fit_hofft_lstsq_support``,
+    but replaces the per-signal OMP / least-squares solve with normalized
+    RBF or inverse-distance weights to the S-nearest-beta support in alpha
+    space -- no dictionary, Gram matrix, or phase-model matvec is needed, so
+    this is considerably cheaper to compute.
+
+    Args
+    ----
+    phis : torch.Tensor
+        Spatial phase maps with shape (B, *im_size)
+    alphas : torch.Tensor
+        Temporal phase coefficients with shape (B, *trj_size)
+    hparams : hofft_params
+        HOFFT parameters.
+    sparams : sparse_params
+        Sparse decomposition parameters. sparams.Q sets the number of compressed
+        kernels (representative betas); sparams.S sets the sparsity level.
+    spatial_mask : Optional[torch.Tensor]
+        Spatial mask with shape (*im_size)
+    num_als_iter : int
+        Number of ALS iterations for the 'k_alphas' decomposition.
+    kernel : str
+        'rbf' -> w(delta) = exp(-delta^2 / 2), or 'inv_dist' -> w(delta) = 1 / (delta^p + eps).
+    d : float
+        Distance-scaling hyperparameter (see math_docs/sparse_fit.md). Ignored
+        (overwritten) if auto_tune is True.
+    p : float
+        Power for the inverse-distance kernel. Ignored (overwritten) if
+        auto_tune is True and kernel == 'inv_dist'.
+    eps : float
+        Regularization for the inverse-distance kernel and coefficient normalization.
+    auto_tune : bool
+        If True, picks d (and p, for 'inv_dist') via ``sweep_smooth_interp_hyperparams``:
+        the k_alphas spatial_factors are held fixed and compared against the
+        exact ("full") HOFFT kernels on a validation subset of num_val
+        trajectory points (see math_docs/sparse_fit.md).
+    d_grid : tuple
+        Candidate d values to sweep when auto_tune is True.
+    p_grid : tuple
+        Candidate p values to sweep when auto_tune is True and kernel == 'inv_dist'.
+    num_val : int
+        Number of held-out trajectory points used for auto_tune.
+
+    Returns
+    -------
+    spatial_factors : torch.Tensor
+        Spatial factors with shape (L, *im_size)
+    compressed_kernels : torch.Tensor
+        Compressed HOFFT kernels with shape (L, *kern_size, Q)
+    sparse_inds : torch.Tensor
+        Sparse indices with shape (S, *trj_size) in [0, Q)
+    sparse_coeffs : torch.Tensor
+        Sparse coefficients with shape (S, *trj_size)
+    """
+    im_size = phis.shape[1:]
+    torch_dev = phis.device
+    kern_size = hparams.kern_size
+    os = hparams.os
+    verbose = hparams.verbose
+    reduced_im_size = hparams.reduced_im_size
+    spatial_init = hparams.spatial_init
+    Q = sparams.Q
+    S = sparams.S
+    num_valid = sparams.num_validation
+    kernel = sparams.interp_type
+    temporal_batch_size = sparams.temporal_batch_size
+    assert kernel in ['rbf', 'inv_dist'], "Invalid interpolation type"
+
+    if spatial_mask is None:
+        spatial_mask = torch.ones(im_size, dtype=torch.complex64, device=torch_dev)
+
+    if reduced_im_size is not None:
+        phis_reduced = reduce_spatial(phis, im_size_low=reduced_im_size, order=3)
+        # kern_bases = build_kern_bases(kern_size, reduced_im_size, os=os).to(torch_dev)
+        kern_bases = build_kern_bases(kern_size, im_size, os=os).to(torch_dev)
+        kern_bases = reduce_spatial(kern_bases, im_size_low=reduced_im_size, order=3)
+        spatial_mask_red = reduce_spatial(spatial_mask, im_size_low=reduced_im_size, order=3)
+    else:
+        phis_reduced = phis
+        kern_bases = build_kern_bases(kern_size, im_size, os=os).to(torch_dev)
+        spatial_mask_red = spatial_mask
+
+    # k_alphas decomposition: spatial factors, compressed kernels H_comp, and
+    # the Q representative betas (same as sparse_fit_hofft_omp / lstsq_support).
+    spatial_factors, compressed_kernels, betas = K_alphas_init(
+        phis_reduced, alphas,
+        hparams=hparams,
+        spatial_mask=spatial_mask_red,
+        spatial_init_method=spatial_init,
+        num_als_iter=num_als_iter,
+        K=Q,
+        return_kernels=True,
+    )    
+
+    # Tune d (and p) against a validation subset of exact HOFFT kernels, using
+    # the already-fixed spatial_factors from the k_alphas decomposition above.
+    if num_valid is not None:
+        d, p, errors = sweep_smooth_interp_hyperparams(
+            phis_reduced, alphas, spatial_factors, compressed_kernels, betas, kern_bases,
+            sparsity=S, hparams=hparams, kernel=kernel,
+            d_grid=d_grid, p_grid=p_grid, eps=eps, num_val=num_valid,
+            spatial_mask=spatial_mask_red, verbose=verbose,
+        )
+        if verbose:
+            msg = f'Strategy 2.5 auto-tune: picked d={d}'
+            if kernel == 'inv_dist':
+                msg += f', p={p}'
+            print(f'{msg} (validation error {errors.min().item():.4g})')
+
+    # Solve for the sparse coefficients via smooth distance-based weights (Strategy 2.5)
+    sparse_inds, sparse_coeffs = smooth_sparse_coeffs(
+        alphas, betas, sparsity=S,
+        kernel=kernel, d=d, p=p, eps=eps,
+        temporal_batch_size=temporal_batch_size,
+    )
+    
     # Expand spatial
     if reduced_im_size is not None:
-        spatial_factors = expand_spatial(spatial_factors, 
-                                         im_size_high=im_size,
-                                         order=3)
-        
+        spatial_factors = expand_spatial(spatial_factors, im_size_high=im_size, order=3)
+
     return spatial_factors, compressed_kernels, sparse_inds, sparse_coeffs
 
 def b0_correction(b0: torch.Tensor,

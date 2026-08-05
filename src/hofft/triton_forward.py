@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -7,6 +9,37 @@ __all__ = [
     'hofft_adjoint_fused',
 ]
 
+# Used when auto_tune=False (the default): no search, no per-shape recompile
+# cost, just launch directly with these. Manually found to work well for the
+# highres_spiral (2D) case -- but per the module-level note below, the true
+# optimum shifts with problem shape and GPU, so this is a starting point, not
+# a universal answer. Pass auto_tune=True to search instead when you can
+# afford the one-time cost (see hofft_forward_fused/hofft_adjoint_fused).
+BLOCK_T_DEFAULT = 128
+NUM_WARPS_DEFAULT = 8
+
+# Candidate (BLOCK_T, num_warps) combinations to search over when auto_tune=True.
+# The optimum shifts with T, Cb, and K (larger K in 3D changes register
+# pressure per unrolled iteration, which changes the BLOCK_T/num_warps
+# trade-off) -- so this is autotuned per-shape rather than hardcoded.
+_AUTOTUNE_CONFIGS = [
+    triton.Config({'BLOCK_T': 64}, num_warps=2),
+    triton.Config({'BLOCK_T': 64}, num_warps=4),
+    triton.Config({'BLOCK_T': 128}, num_warps=4),
+    triton.Config({'BLOCK_T': 128}, num_warps=8),
+    triton.Config({'BLOCK_T': 256}, num_warps=4),
+    triton.Config({'BLOCK_T': 256}, num_warps=8),
+    triton.Config({'BLOCK_T': 512}, num_warps=8),
+    triton.Config({'BLOCK_T': 512}, num_warps=16),
+    triton.Config({'BLOCK_T': 1024}, num_warps=8),
+    triton.Config({'BLOCK_T': 1024}, num_warps=16),
+]
+# Re-search whenever any of these (runtime, non-constexpr) args change --
+# they're what plausibly shifts the optimal config. Lb/K/S/HAS_BIAS are
+# tl.constexpr, so a change in any of those already compiles (and tunes) an
+# entirely separate kernel specialization without needing to be listed here.
+_AUTOTUNE_KEY = ['T', 'Cb', 'NPIX', 'Q']
+
 
 @triton.jit
 def _hofft_forward_kernel(
@@ -15,9 +48,13 @@ def _hofft_forward_kernel(
     sidx_ptr,                        # (S * T,) int (linear into Q, per trj point)
     sc_re_ptr, sc_im_ptr,            # (S * T,) float32  (sparse coeffs)
     idx_lin_ptr,                     # (T * K,) int (linear into NPIX, per trj point)
+    bias_re_ptr, bias_im_ptr,        # (Lb * K,) float32  (per-(l,k) bias kernel)
     out_re_ptr, out_im_ptr,          # (Cb * T,) float32
-    Cb, Lb, K, Q, NPIX, T,
+    Cb, Q, NPIX, T,
+    Lb: tl.constexpr,
+    K: tl.constexpr,
     S: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
@@ -25,11 +62,16 @@ def _hofft_forward_kernel(
     Fused forward: for each trajectory point t and coil c,
 
         out[c, t] = sum_l sum_k FMSx[c, l, idx_lin[t, k]]
-                              * ( sum_s comp[l, k, sidx[s, t]] * sc[s, t] )
+                              * ( bias[l, k] + sum_s comp[l, k, sidx[s, t]] * sc[s, t] )
 
     One program handles a tile of BLOCK_T trajectory points across all coils.
     Neither the (C,L,K,*trj) blocks tensor nor the (L,K,S,*trj) gather is
     materialized -- everything is accumulated in registers per point.
+
+    `Lb`/`K`/`S` are tl.constexpr so the (l, k, s) loops fully unroll at
+    compile time: the compiler can then interleave/pipeline the otherwise
+    latency-bound dependent loads across iterations instead of executing a
+    genuine serial runtime loop with a branch every iteration.
     """
     pid = tl.program_id(0)
     offs_t = (pid * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
@@ -59,6 +101,12 @@ def _hofft_forward_kernel(
                 w_re += ck_re * sc_re - ck_im * sc_im
                 w_im += ck_re * sc_im + ck_im * sc_re
 
+            if HAS_BIAS:
+                # bias[l, k] is constant across t: one scalar load, broadcast
+                bk_off = l * K + k
+                w_re += tl.load(bias_re_ptr + bk_off)
+                w_im += tl.load(bias_im_ptr + bk_off)
+
             # gather FMSx[c, l, idx_lin[t, k]] for all coils -> (BLOCK_C, BLOCK_T)
             gidx = tl.load(idx_lin_ptr + offs_t * K + k, mask=mask_t, other=0).to(tl.int64)
             f_off = (offs_c[:, None] * Lb + l) * NPIX + gidx[None, :]
@@ -73,18 +121,42 @@ def _hofft_forward_kernel(
     tl.store(out_im_ptr + out_off, acc_im, mask=fmask)
 
 
+# Autotuned kernels are built lazily. triton.autotune() touches the active CUDA
+# driver at construction time, so doing it at import fails on CPU-only hosts
+# (RuntimeError: 0 active drivers). See _get_forward_kernel_autotuned /
+# _get_adjoint_kernel_autotuned below.
+_hofft_forward_kernel_autotuned = None
+_hofft_adjoint_kernel_autotuned = None
+
+
+def _get_forward_kernel_autotuned():
+    """Lazily wrap _hofft_forward_kernel with @triton.autotune (CUDA only)."""
+    global _hofft_forward_kernel_autotuned
+    if _hofft_forward_kernel_autotuned is None:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "triton.autotune requires a CUDA device; "
+                "call with auto_tune=False on CPU, or run on GPU.")
+        _hofft_forward_kernel_autotuned = triton.autotune(
+            configs=_AUTOTUNE_CONFIGS, key=_AUTOTUNE_KEY,
+        )(_hofft_forward_kernel)
+    return _hofft_forward_kernel_autotuned
+
+
 def hofft_forward_fused(FMSx: torch.Tensor,
                         idx_lin: torch.Tensor,
                         comp_kernels: torch.Tensor,
                         sparse_idxs: torch.Tensor,
                         sparse_coeffs: torch.Tensor,
-                        BLOCK_T: int = 256) -> torch.Tensor:
+                        bias_kernel: Optional[torch.Tensor] = None,
+                        auto_tune: bool = False) -> torch.Tensor:
     """
     Fused HOFFT forward block-extraction + sparse-kernel apply.
 
     Computes, for each coil c and trajectory point t:
         out[c, t] = sum_l sum_k FMSx[c, l, idx_lin[t, k]]
-                              * ( sum_s comp_kernels[l, k, sparse_idxs[s, t]] * sparse_coeffs[s, t] )
+                              * ( bias_kernel[l, k]
+                                  + sum_s comp_kernels[l, k, sparse_idxs[s, t]] * sparse_coeffs[s, t] )
 
     Args
     ----
@@ -98,6 +170,14 @@ def hofft_forward_fused(FMSx: torch.Tensor,
         Sparse indices into Q for each (sparsity term, trajectory point).
     sparse_coeffs : (S, T) complex64
         Sparse coefficients.
+    bias_kernel : (Lb, K) complex64, optional
+        Per-(field, kernel offset) bias added to every trajectory point's
+        reconstructed kernel weight. If None, no bias is applied.
+    auto_tune : bool
+        If False (default), launches directly with BLOCK_T_DEFAULT/
+        NUM_WARPS_DEFAULT -- no search, no one-time per-shape tuning cost.
+        If True, uses @triton.autotune to search _AUTOTUNE_CONFIGS the first
+        time this (T, Cb, NPIX, Q) shape is seen, then caches the winner.
 
     Returns
     -------
@@ -130,29 +210,50 @@ def hofft_forward_fused(FMSx: torch.Tensor,
     sidx = sparse_idxs.reshape(-1).contiguous().to(torch.int32)
     idx_lin_flat = idx_lin.reshape(-1).contiguous().to(torch.int32)
 
+    HAS_BIAS = bias_kernel is not None
+    if HAS_BIAS:
+        assert bias_kernel.shape == (Lb, K), \
+            f"bias_kernel shape {tuple(bias_kernel.shape)} != {(Lb, K)}"
+        bk = bias_kernel.reshape(-1).contiguous()
+        bias_re = bk.real.contiguous()
+        bias_im = bk.imag.contiguous()
+    else:
+        bias_re = torch.empty((1,), device=dev, dtype=torch.float32)
+        bias_im = bias_re
+
+    return _launch_forward_kernel(fmsx_re, fmsx_im, comp_re, comp_im, sidx, sc_re, sc_im,
+                                  idx_lin_flat, bias_re, bias_im, HAS_BIAS,
+                                  Cb, Lb, K, Q, NPIX, T, S, auto_tune)
+
+
+def _launch_forward_kernel(fmsx_re: torch.Tensor, fmsx_im: torch.Tensor,
+                           comp_re: torch.Tensor, comp_im: torch.Tensor,
+                           sidx: torch.Tensor, sc_re: torch.Tensor, sc_im: torch.Tensor,
+                           idx_lin_flat: torch.Tensor, bias_re: torch.Tensor, bias_im: torch.Tensor,
+                           HAS_BIAS: bool, Cb: int, Lb: int, K: int, Q: int, NPIX: int,
+                           T: int, S: int, auto_tune: bool = False) -> torch.Tensor:
+    """Launches _hofft_forward_kernel given already-flattened, contiguous,
+    correctly-typed (float32/int32) buffers. No marshalling is performed here --
+    callers own splitting/caching those buffers."""
+    dev = fmsx_re.device
     out_re = torch.empty((Cb * T,), device=dev, dtype=torch.float32)
     out_im = torch.empty((Cb * T,), device=dev, dtype=torch.float32)
 
     BLOCK_C = max(triton.next_power_of_2(Cb), 1)
-    grid = (triton.cdiv(T, BLOCK_T),)
+    common_args = (fmsx_re, fmsx_im, comp_re, comp_im, sidx, sc_re, sc_im,
+                   idx_lin_flat, bias_re, bias_im, out_re, out_im, Cb, Q, NPIX, T)
+    common_kwargs = dict(Lb=Lb, K=K, S=S, HAS_BIAS=HAS_BIAS, BLOCK_C=BLOCK_C)
 
-    _hofft_forward_kernel[grid](
-        fmsx_re, fmsx_im,
-        comp_re, comp_im,
-        sidx,
-        sc_re, sc_im,
-        idx_lin_flat,
-        out_re, out_im,
-        Cb, Lb, K, Q, NPIX, T,
-        S=S,
-        BLOCK_C=BLOCK_C,
-        BLOCK_T=BLOCK_T,
-        num_warps=4,
-    )
+    if auto_tune:
+        grid = lambda META: (triton.cdiv(T, META['BLOCK_T']),)
+        _get_forward_kernel_autotuned()[grid](*common_args, **common_kwargs)
+    else:
+        grid = (triton.cdiv(T, BLOCK_T_DEFAULT),)
+        _hofft_forward_kernel[grid](*common_args, **common_kwargs,
+                                    BLOCK_T=BLOCK_T_DEFAULT, num_warps=NUM_WARPS_DEFAULT)
 
     out = torch.complex(out_re, out_im).reshape(Cb, T)
     return out
-
 
 @triton.jit
 def _hofft_adjoint_kernel(
@@ -161,9 +262,13 @@ def _hofft_adjoint_kernel(
     sidx_ptr,                        # (S * T,) int
     sc_re_ptr, sc_im_ptr,            # (S * T,) float32
     idx_lin_ptr,                     # (T * K,) int
+    bias_re_ptr, bias_im_ptr,        # (Lb * K,) float32  (per-(l,k) bias kernel)
     grid_re_ptr, grid_im_ptr,        # (Cb * Lb * NPIX,) float32, zero-init, atomic_add
-    Cb, Lb, K, Q, NPIX, T,
+    Cb, Q, NPIX, T,
+    Lb: tl.constexpr,
+    K: tl.constexpr,
     S: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
@@ -171,10 +276,15 @@ def _hofft_adjoint_kernel(
     Fused adjoint (transpose of _hofft_forward_kernel). For each trajectory
     point t, coil c, field l, kernel offset k:
 
-        grid[c, l, idx_lin[t, k]] += y[c, t] * conj( sum_s comp[l, k, sidx[s, t]] * sc[s, t] )
+        grid[c, l, idx_lin[t, k]] += y[c, t]
+                                     * conj( bias[l, k] + sum_s comp[l, k, sidx[s, t]] * sc[s, t] )
 
     Scatter-adds (via atomic_add) into the oversampled grid. This is the exact
     transpose of the forward gather+contract, so A^H matches A for CG.
+
+    `Lb`/`K`/`S` are tl.constexpr for the same reason as in
+    `_hofft_forward_kernel` -- fully unrolled loops let the compiler pipeline
+    the dependent loads instead of serializing them.
     """
     pid = tl.program_id(0)
     offs_t = (pid * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
@@ -205,6 +315,12 @@ def _hofft_adjoint_kernel(
                 w_re += ck_re * sc_re - ck_im * sc_im
                 w_im += ck_re * sc_im + ck_im * sc_re
 
+            if HAS_BIAS:
+                # bias[l, k] is constant across t: one scalar load, broadcast
+                bk_off = l * K + k
+                w_re += tl.load(bias_re_ptr + bk_off)
+                w_im += tl.load(bias_im_ptr + bk_off)
+
             # val[c, t] = y[c, t] * conj(w[t]);  conj(w) = w_re - i w_im
             # (a + bi)(w_re - i w_im) = (a*w_re + b*w_im) + i(b*w_re - a*w_im)
             vr = y_re * w_re[None, :] + y_im * w_im[None, :]
@@ -216,20 +332,44 @@ def _hofft_adjoint_kernel(
             tl.atomic_add(grid_im_ptr + g_off, vi, mask=cmask)
 
 
+def _get_adjoint_kernel_autotuned():
+    """Lazily wrap _hofft_adjoint_kernel with @triton.autotune (CUDA only).
+
+    reset_to_zero is required here (unlike the forward kernel): this kernel
+    accumulates into grid_re_ptr/grid_im_ptr via atomic_add rather than
+    overwriting via tl.store, so without it, repeated benchmark trials during
+    the search would add on top of each other and corrupt the result of the
+    call that triggers the search.
+    """
+    global _hofft_adjoint_kernel_autotuned
+    if _hofft_adjoint_kernel_autotuned is None:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "triton.autotune requires a CUDA device; "
+                "call with auto_tune=False on CPU, or run on GPU.")
+        _hofft_adjoint_kernel_autotuned = triton.autotune(
+            configs=_AUTOTUNE_CONFIGS, key=_AUTOTUNE_KEY,
+            reset_to_zero=['grid_re_ptr', 'grid_im_ptr'],
+        )(_hofft_adjoint_kernel)
+    return _hofft_adjoint_kernel_autotuned
+
+
 def hofft_adjoint_fused(y: torch.Tensor,
                         idx_lin: torch.Tensor,
                         comp_kernels: torch.Tensor,
                         sparse_idxs: torch.Tensor,
                         sparse_coeffs: torch.Tensor,
                         NPIX: int,
-                        BLOCK_T: int = 256) -> torch.Tensor:
+                        bias_kernel: Optional[torch.Tensor] = None,
+                        auto_tune: bool = False) -> torch.Tensor:
     """
     Fused HOFFT adjoint: gridding of k-space onto the oversampled grid.
 
     Exact transpose of `hofft_forward_fused`. Computes, for each coil c and
     field l:
         grid[c, l, p] = sum_{t, k : idx_lin[t,k]==p} y[c, t]
-                        * conj( sum_s comp_kernels[l, k, sparse_idxs[s, t]] * sparse_coeffs[s, t] )
+                        * conj( bias_kernel[l, k]
+                                + sum_s comp_kernels[l, k, sparse_idxs[s, t]] * sparse_coeffs[s, t] )
 
     Args
     ----
@@ -242,6 +382,14 @@ def hofft_adjoint_fused(y: torch.Tensor,
     sparse_coeffs : (S, T) complex64
     NPIX : int
         prod(im_size_os).
+    bias_kernel : (Lb, K) complex64, optional
+        Per-(field, kernel offset) bias added to every trajectory point's
+        reconstructed kernel weight (matching the forward). If None, no bias.
+    auto_tune : bool
+        If False (default), launches directly with BLOCK_T_DEFAULT/
+        NUM_WARPS_DEFAULT -- no search, no one-time per-shape tuning cost.
+        If True, uses @triton.autotune to search _AUTOTUNE_CONFIGS the first
+        time this (T, Cb, NPIX, Q) shape is seen, then caches the winner.
 
     Returns
     -------
@@ -273,25 +421,47 @@ def hofft_adjoint_fused(y: torch.Tensor,
     sidx = sparse_idxs.reshape(-1).contiguous().to(torch.int32)
     idx_lin_flat = idx_lin.reshape(-1).contiguous().to(torch.int32)
 
+    HAS_BIAS = bias_kernel is not None
+    if HAS_BIAS:
+        assert bias_kernel.shape == (Lb, K), \
+            f"bias_kernel shape {tuple(bias_kernel.shape)} != {(Lb, K)}"
+        bk = bias_kernel.reshape(-1).contiguous()
+        bias_re = bk.real.contiguous()
+        bias_im = bk.imag.contiguous()
+    else:
+        bias_re = torch.empty((1,), device=dev, dtype=torch.float32)
+        bias_im = bias_re
+
+    return _launch_adjoint_kernel(y_re, y_im, comp_re, comp_im, sidx, sc_re, sc_im,
+                                  idx_lin_flat, bias_re, bias_im, HAS_BIAS,
+                                  Cb, Lb, K, Q, NPIX, T, S, auto_tune)
+
+
+def _launch_adjoint_kernel(y_re: torch.Tensor, y_im: torch.Tensor,
+                           comp_re: torch.Tensor, comp_im: torch.Tensor,
+                           sidx: torch.Tensor, sc_re: torch.Tensor, sc_im: torch.Tensor,
+                           idx_lin_flat: torch.Tensor, bias_re: torch.Tensor, bias_im: torch.Tensor,
+                           HAS_BIAS: bool, Cb: int, Lb: int, K: int, Q: int, NPIX: int,
+                           T: int, S: int, auto_tune: bool = False) -> torch.Tensor:
+    """Launches _hofft_adjoint_kernel given already-flattened, contiguous,
+    correctly-typed (float32/int32) buffers. No marshalling is performed here --
+    callers own splitting/caching those buffers."""
+    dev = y_re.device
     grid_re = torch.zeros((Cb * Lb * NPIX,), device=dev, dtype=torch.float32)
     grid_im = torch.zeros((Cb * Lb * NPIX,), device=dev, dtype=torch.float32)
 
     BLOCK_C = max(triton.next_power_of_2(Cb), 1)
-    grid = (triton.cdiv(T, BLOCK_T),)
+    common_args = (y_re, y_im, comp_re, comp_im, sidx, sc_re, sc_im,
+                   idx_lin_flat, bias_re, bias_im, grid_re, grid_im, Cb, Q, NPIX, T)
+    common_kwargs = dict(Lb=Lb, K=K, S=S, HAS_BIAS=HAS_BIAS, BLOCK_C=BLOCK_C)
 
-    _hofft_adjoint_kernel[grid](
-        y_re, y_im,
-        comp_re, comp_im,
-        sidx,
-        sc_re, sc_im,
-        idx_lin_flat,
-        grid_re, grid_im,
-        Cb, Lb, K, Q, NPIX, T,
-        S=S,
-        BLOCK_C=BLOCK_C,
-        BLOCK_T=BLOCK_T,
-        num_warps=4,
-    )
+    if auto_tune:
+        grid = lambda META: (triton.cdiv(T, META['BLOCK_T']),)
+        _get_adjoint_kernel_autotuned()[grid](*common_args, **common_kwargs)
+    else:
+        grid = (triton.cdiv(T, BLOCK_T_DEFAULT),)
+        _hofft_adjoint_kernel[grid](*common_args, **common_kwargs,
+                                    BLOCK_T=BLOCK_T_DEFAULT, num_warps=NUM_WARPS_DEFAULT)
 
     out = torch.complex(grid_re, grid_im).reshape(Cb, Lb, NPIX)
     return out

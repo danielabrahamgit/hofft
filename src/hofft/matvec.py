@@ -23,6 +23,7 @@ from .phase_coeffs import (
     kmeans_quantization, 
     maxmin_quantization
 )
+from .cur_ops import build_cur_factors, build_cur_factors_adaptive
 
 SubsampleMode = Literal['random', 'fixed']
 
@@ -708,7 +709,10 @@ class matvec_cur(matvec):
     def __init__(self,
                  phis: torch.Tensor,
                  alphas: torch.Tensor,
-                 cur_rank: int = 100,
+                 cur_rank: Optional[int] = None,
+                 rank_phi: Optional[int] = None,
+                 rank_alpha: Optional[int] = None,
+                 cluster_method: str = 'maxmin',
                  spatial_batch_size: Optional[int] = None,
                  temporal_batch_size: Optional[int] = None):
         """
@@ -719,40 +723,45 @@ class matvec_cur(matvec):
         alphas : torch.Tensor
             Temporal phase coefficients with shape (B, *trj_size)
         cur_rank : int
-            Number of columns to sample for CUR decomposition.
+            CUR rank when rank_phi / rank_alpha are None
+        rank_phi : Optional[int]
+            number of spatial (phi) representatives
+        rank_alpha : Optional[int]
+            number of temporal (alpha) representatives
+        cluster_method : str
+            'maxmin' (default) or 'kmeans'
         spatial_batch_size : Optional[int]
             Spatial batch size for the matrix-vector operation.
         temporal_batch_size : Optional[int]
             Temporal batch size for the matrix-vector operation.
         """
         super(matvec_cur, self).__init__(phis, alphas, spatial_batch_size, temporal_batch_size)
+
+        phis_flt = phis.reshape((self.B, -1))
+        alphas_flt = alphas.reshape((self.B, -1))
         
-        # Normalize phis and alphas before clustering
-        phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis.reshape((self.B, -1)), alphas.reshape((self.B, -1)))
-        
-        # Pick clusters
-        method = 'kmeans'
-        B = alphas.shape[0]
-        alpha_clusts, _ = pick_K_vectors(vectors=alphas_nrm.reshape((B,-1)).T, K=cur_rank, sigma=0, method=method)
-        alpha_clusts = alpha_clusts + alphas_mp
-        phi_clusts, _ = pick_K_vectors(vectors=phis_nrm.reshape((B,-1)).T, K=cur_rank, sigma=0, method=method)
-        phi_clusts = phi_clusts + phis_mp
-        
-        # Build R and C matrices
-        R = torch.exp(-2j * torch.pi * (alpha_clusts @ (phis_nrm + phis_mp[:, None]))) # K R
-        C = torch.exp(-2j * torch.pi * (phi_clusts @ (alphas_nrm + alphas_mp[:, None]))) # K T
-        
-        # Buiild U matrix
-        W = torch.exp(-2j * torch.pi * (alpha_clusts @ phi_clusts.T)) # K K
-        U = torch.linalg.pinv(W)
-        
-        # Reshape matrices and save
-        self.R = R.reshape((cur_rank, *self.im_size))
-        self.R = einsum(U, self.R, 'Ko K, K ... -> Ko ...')
-        self.C = C.reshape((cur_rank, *self.trj_size))
-        
-        # Save stuff for normal operator
-        self.normal_factor = einsum(self.C.conj(), self.C, 'Kl ..., Kr ... -> Kl Kr')
+        if cur_rank is None and rank_phi is None and rank_alpha is None:
+            R, C, cur_rank = build_cur_factors_adaptive(
+                phis_flt, alphas_flt,
+                max_rank=1000,
+                min_rank=1,
+                tol=1e-3,
+                check_every=20,
+                n_val=2**11,
+                verbose=True
+            )            
+        else:
+            R, C = build_cur_factors(
+                phis_flt, alphas_flt,
+                rank=cur_rank,
+                rank_phi=rank_phi,
+                rank_alpha=rank_alpha,
+                cluster_method=cluster_method,
+            )
+        K = R.shape[0]
+        self.curR = R.reshape((K, *self.im_size))
+        self.curC = C.reshape((K, *self.trj_size))
+        self.normal_factor = einsum(self.curC.conj(), self.curC, 'Kl ..., Kr ... -> Kl Kr')
         
     def forward(self,
                 x: torch.Tensor) -> torch.Tensor:
@@ -773,8 +782,8 @@ class matvec_cur(matvec):
         N = x.shape[0]
         
         # Perform the CUR decomposition
-        coeffs = einsum(x, self.R, 'N ..., K ... -> N K')
-        y = einsum(coeffs, self.C, 'N K, K ... -> N ...')
+        coeffs = einsum(x, self.curR, 'N ..., K ... -> N K')
+        y = einsum(coeffs, self.curC, 'N K, K ... -> N ...')
         
         return y
     
@@ -797,8 +806,8 @@ class matvec_cur(matvec):
         N = y.shape[0]
         
         # Perform the CUR decomposition
-        coeffs = einsum(y, self.C.conj(), 'N ..., K ... -> N K')
-        x = einsum(coeffs, self.R.conj(), 'N K, K ... -> N ...')
+        coeffs = einsum(y, self.curC.conj(), 'N ..., K ... -> N K')
+        x = einsum(coeffs, self.curR.conj(), 'N K, K ... -> N ...')
         
         return x
     
@@ -818,9 +827,9 @@ class matvec_cur(matvec):
             Output signal with shape (N, *im_size)
         """
         # return self.adjoint(self.forward(x))
-        coeffs = einsum(x, self.R, 'N ..., K ... -> N K')
+        coeffs = einsum(x, self.curR, 'N ..., K ... -> N K')
         coeffs = einsum(coeffs, self.normal_factor, 'N K, Ko K -> N Ko')
-        return einsum(coeffs, self.R.conj(), 'N K, K ... -> N ...')
+        return einsum(coeffs, self.curR.conj(), 'N K, K ... -> N ...')
 
 class matvec_histogram(matvec):
     
@@ -1047,3 +1056,88 @@ class matvec_rnd(matvec):
         x = x_flt.reshape((N, *self.im_size))
         
         return x
+
+
+class matvec_rnd_fast(matvec):
+    """
+    Fixed random spatial sketch of the phase encoding matvec.
+
+    Same approximation idea as ``matvec_rnd`` (sum only over a random voxel
+    subset), but the subset and the sketched encoding block
+    ``A[I, :] = exp(-2pi j phi_I · alpha)`` are built once at init. Forward is
+    a single matmul against that cached block — no per-call ``exp`` and no CUR
+    / ``pinv`` coupling. The adjoint is the exact adjoint of this sketched
+    forward (support restricted to ``I``), so ``normal = A^H A`` is consistent.
+    """
+
+    def __init__(self,
+                 phis: torch.Tensor,
+                 alphas: torch.Tensor,
+                 rnd_frac_phis: float = 0.1,
+                 rnd_frac_alphas: float = 0.1,
+                 rank_phi: Optional[int] = None,
+                 seed: int = 0,
+                 rescale: bool = True,
+                 spatial_batch_size: Optional[int] = None,
+                 temporal_batch_size: Optional[int] = None):
+        """
+        Args
+        ----
+        phis : torch.Tensor
+            Spatial phase maps with shape (B, *im_size)
+        alphas : torch.Tensor
+            Temporal phase coefficients with shape (B, *trj_size)
+        rnd_frac_phis : float
+            Fraction of voxels in the sketch (ignored if ``rank_phi`` is set).
+        rnd_frac_alphas : float
+            Unused (kept for API parity with ``matvec_rnd``). Forward sketches
+            space only; the adjoint matches that sketched operator.
+        rank_phi : Optional[int]
+            Explicit sketch size (number of voxels).
+        seed : int
+            RNG seed for the fixed voxel draw.
+        rescale : bool
+            If True, scale by ``R / |I|`` for an unbiased Monte Carlo estimate
+            of the full spatial sum.
+        spatial_batch_size, temporal_batch_size : Optional[int]
+            ``temporal_batch_size`` controls how the cached ``A[I, :]`` is built.
+        """
+        super(matvec_rnd_fast, self).__init__(
+            phis, alphas, spatial_batch_size, temporal_batch_size)
+        _ = rnd_frac_alphas  # API parity only
+
+        phis_flt = self.phis.reshape((self.B, -1))
+        alphas_flt = self.alphas.reshape((self.B, -1))
+        R = phis_flt.shape[1]
+        T = alphas_flt.shape[1]
+        Rp = rank_phi if rank_phi is not None else subsample_count(R, rnd_frac_phis)
+
+        voxel_inds = subsample_idx(R, Rp, phis_flt.device, mode='fixed', seed=seed)
+        phis_I = phis_flt[:, voxel_inds]  # (B, R')
+
+        # Build A[I, :] once, batched over time to limit peak memory.
+        enc = torch.empty((Rp, T), dtype=torch.complex64, device=phis_flt.device)
+        tb = self.temporal_batch_size
+        for t1 in range(0, T, tb):
+            t2 = min(t1 + tb, T)
+            enc[:, t1:t2] = torch.exp(
+                -2j * torch.pi * (phis_I.T @ alphas_flt[:, t1:t2])
+            )
+
+        self.voxel_inds = voxel_inds
+        self.enc_mat = enc                          # (R', T)
+        self.scale = (R / Rp) if rescale else 1.0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        N = x.shape[0]
+        x_I = x.reshape((N, -1))[:, self.voxel_inds]  # (N, R')
+        y_flt = self.scale * (x_I @ self.enc_mat)     # (N, T)
+        return y_flt.reshape((N, *self.trj_size))
+
+    def adjoint(self, y: torch.Tensor) -> torch.Tensor:
+        N = y.shape[0]
+        y_flt = y.reshape((N, -1))                    # (N, T)
+        x_I = self.scale * (y_flt @ self.enc_mat.conj().T)  # (N, R')
+        x_flt = torch.zeros((N, self.R), dtype=y.dtype, device=y.device)
+        x_flt[:, self.voxel_inds] = x_I
+        return x_flt.reshape((N, *self.im_size))
