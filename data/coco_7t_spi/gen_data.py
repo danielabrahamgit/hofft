@@ -128,7 +128,7 @@ def main() -> None:
     # b0 = spatial_resize_poly(b0, im_size, order=3)
     # torch.save(b0.cpu(), SCRIPT_DIR / 'b0.pt')
     
-    rep_indices = list(range(0, 6))
+    rep_indices = list(range(0, 18))
     n_tr = N_ROT
 
     print(f'Subsampling: {len(rep_indices)} Rep groups, {n_tr} TRs, {N_POINT} readout pts')
@@ -154,8 +154,9 @@ def main() -> None:
     #     ksp.append(kspi)
     # ksp = torch.stack(ksp, dim=-2).to(torch_dev)
     # _, ksp = calc_coil_subspace(ksp[:, :5000, 0, :], N_COMP_COIL, ksp)
-    ofs = 3
-    ksp = torch.load(SCRIPT_DIR / 'ksp_allread.pt', map_location=torch_dev)[:, ofs:ofs+trj.shape[0]]
+    # ofs = 3
+    ksp = torch.load(SCRIPT_DIR / 'ksp_allread.pt', map_location=torch_dev)
+    ksp = ksp[:, ofs:ofs+trj.shape[0]].to(torch_dev)
     
     # --- dcf + concomitant fields ---
     print('Computing DCF')

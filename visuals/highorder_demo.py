@@ -39,14 +39,9 @@ phi0 = b0 * mask
 phi0 /= np.abs(phi0).max()
 crds = gen_grd(mps.shape[1:]).numpy()
 phi1 = (3 * crds[..., 1] * crds[..., 0]**2 - crds[..., 1]**3) * mask
-phi1 = (crds[..., 0] ** 2 + crds[..., 1] ** 2) * mask
 phi1 /= np.abs(phi1).max()
-
-plt.imshow(phi1 / mask, cmap='RdBu_r', vmin=-0.5*2, vmax=0.5*2)
-plt.axis('off')
-plt.show()
-quit()
-
+phi2 = (crds[..., 0] ** 2 + crds[..., 1] ** 2) * mask
+phi2 /= np.abs(phi2).max()
 
 # ---------------------------------------------------------------------------
 # Smooth alpha-space trajectory

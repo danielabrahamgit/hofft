@@ -11,18 +11,11 @@ import torch
 import sigpy as sp
 import numpy as np
 
-from mr_recon.utils import torch_to_np, np_to_torch, resize, quantize_data, pick_K_vectors
+from mr_recon.utils import torch_to_np, np_to_torch, resize
 from mr_recon.fourier import sigpy_nufft, fft, ifft
-from mr_recon.spatial import spatial_resize_poly
-from mr_recon.algs import svd_operator
-from mr_recon.imperfections.field import rescale_phis_alphas
 from typing import Literal, Optional, Union
 from einops import einsum
-from .phase_coeffs import (
-    uniform_quantization, 
-    kmeans_quantization, 
-    maxmin_quantization
-)
+from tqdm import tqdm
 from .cur_ops import build_cur_factors, build_cur_factors_adaptive
 
 SubsampleMode = Literal['random', 'fixed']
@@ -67,6 +60,7 @@ class matvec(torch.nn.Module):
                  alphas: torch.Tensor,
                  spatial_batch_size: Optional[int] = None,
                  temporal_batch_size: Optional[int] = None,
+                 verbose: bool = False,
                 ):
         """
         Args
@@ -83,6 +77,8 @@ class matvec(torch.nn.Module):
             Spatial weights with shape (*im_size)
         temporal_weights : Optional[torch.Tensor]
             Temporal weights with shape (*trj_size)
+        verbose : bool
+            Whether to print verbose output.
         """
         super(matvec, self).__init__()
         self.phis = phis.to(torch.float32)
@@ -91,6 +87,7 @@ class matvec(torch.nn.Module):
         self.trj_size = self.alphas.shape[1:]
         self.ishape = self.im_size
         self.oshape = self.trj_size
+        self.verbose = verbose
         self.R = np.prod(self.im_size)
         self.T = np.prod(self.trj_size)
         self.B = self.phis.shape[0]
@@ -165,8 +162,7 @@ class matvec_naive(matvec):
     def __init__(self,
                  phis: torch.Tensor,
                  alphas: torch.Tensor,
-                 spatial_batch_size: Optional[int] = None,
-                 temporal_batch_size: Optional[int] = None):
+                 **kwargs):
         """
         Args
         ----
@@ -174,12 +170,8 @@ class matvec_naive(matvec):
             Spatial phase maps with shape (B, *im_size)
         alphas : torch.Tensor
             Temporal phase coefficients with shape (B, *trj_size)
-        spatial_batch_size : Optional[int]
-            Spatial batch size for the matrix-vector operation.
-        temporal_batch_size : Optional[int]
-            Temporal batch size for the matrix-vector operation.
         """
-        super(matvec_naive, self).__init__(phis, alphas, spatial_batch_size, temporal_batch_size)
+        super(matvec_naive, self).__init__(phis, alphas, **kwargs)
         
         # Flatten phis and alphas
         B = phis.shape[0]
@@ -206,10 +198,15 @@ class matvec_naive(matvec):
         T = self.T
         R = self.R
         
+        # Progress bar
+        pbar = tqdm(range(0, R, self.spatial_batch_size), 
+                    desc='Matvec Naive Forward', 
+                    disable=not self.verbose)
+        
         # Perform the matrix-vector operation
         x_flt = x.reshape((N, -1)) # N R
         y_flt = torch.zeros((N, T), dtype=x.dtype, device=x.device)
-        for r1 in range(0, R, self.spatial_batch_size):
+        for r1 in pbar:
             r2 = min(r1 + self.spatial_batch_size, R)
             for t1 in range(0, T, self.temporal_batch_size):
                 t2 = min(t1 + self.temporal_batch_size, T)
@@ -241,10 +238,15 @@ class matvec_naive(matvec):
         R = self.R    
         T = self.T
         
+        # Progress bar
+        pbar = tqdm(range(0, R, self.spatial_batch_size),
+                    desc='Matvec Naive Adjoint',
+                    disable=not self.verbose)
+
         # Perform the matrix-vector operation
         y_flt = y.reshape((N, -1)) # N T
         x_flt = torch.zeros((N, R), dtype=y.dtype, device=y.device)
-        for r1 in range(0, R, self.spatial_batch_size):
+        for r1 in pbar:
             r2 = min(r1 + self.spatial_batch_size, R)
             for t1 in range(0, T, self.temporal_batch_size):
                 t2 = min(t1 + self.temporal_batch_size, T)
@@ -557,153 +559,7 @@ class matvec_type3(matvec):
             
             # ----------------- Step 5: Reshape and pray -----------------
             return x.reshape((N, *self.ishape))
-
-class matvec_svd(matvec):
-    
-    def __init__(self,
-                 phis: torch.Tensor,
-                 alphas: torch.Tensor,
-                 svd_rank: int = 100,
-                 svd_method: str = 'torch',
-                 num_iter: int = 15,
-                 im_size_low: Optional[tuple] = None,
-                 trj_size_low: Optional[tuple] = None,
-                 poly_order_img: int = 3,
-                 poly_order_trj: int = 3,
-                 spatial_batch_size: Optional[int] = None,
-                 temporal_batch_size: Optional[int] = None):
-        """
-        Args
-        ----
-        phis : torch.Tensor
-            Spatial phase maps with shape (B, *im_size)
-        alphas : torch.Tensor
-            Temporal phase coefficients with shape (B, *trj_size)
-        svd_rank : Optional[int]
-            Number of singular values to keep.
-        svd_method : Optional[str]
-            Method to use for SVD.
-            'torch' - uses torch.svd
-            'lobpcg' - uses iterative lobpcg algorithm, spatial/temporal batching supported
-            'power' - uses power iteration algorithm, spatial/temporal batching supported
-        num_iter : int
-            Number of iterations for svd iterative methods.
-        im_size_low : Optional[tuple]
-            low resolution image size for faster interpolation.
-        trj_size_low : Optional[tuple]
-            low resolution trajectory size for faster interpolation.
-        poly_order_img : Optional[int]
-            Polynomial order for image interpolation.
-        poly_order_trj : Optional[int]
-            Polynomial order for trajectory interpolation.
-        spatial_batch_size : Optional[int]
-            Spatial batch size for the matrix-vector operation.
-        temporal_batch_size : Optional[int]
-            Temporal batch size for the matrix-vector operation.
-        """
-        super(matvec_svd, self).__init__(phis, alphas, spatial_batch_size, temporal_batch_size)
-        self.svd_rank = svd_rank
-        
-        # Downsample if needed
-        if im_size_low is not None:
-            phis = spatial_resize_poly(phis, im_size_low, order=poly_order_img)
-        if trj_size_low is not None:
-            alphas = spatial_resize_poly(alphas, trj_size_low, order=poly_order_trj)
-            
-        # Build flattened encoding matrix
-        phis_flt = phis.reshape((self.B, -1))
-        alphas_flt = alphas.reshape((self.B, -1))
-        enc_mat = torch.exp(-2j * torch.pi * (alphas_flt.T @ phis_flt)) # T R
-            
-        # Perform SVD
-        if svd_method == 'torch':
-            U, S, Vh = torch.linalg.svd(enc_mat, full_matrices=False)
-        else:
-            A = lambda x: einsum(x, enc_mat, 'N R, T R -> N T')
-            enc_normal = enc_mat.H @ enc_mat
-            AHA = lambda x: einsum(x, enc_normal, 'N Ri, Ro Ri -> N Ro')
-            inp_vec = torch.randn(enc_mat.shape[1], dtype=enc_mat.dtype, device=enc_mat.device)
-            if svd_method == 'lobpcg':
-                U, S, Vh = svd_operator(A, AHA, inp_vec, rank=svd_rank, lobpcg=True, num_iter=num_iter)
-            elif svd_method == 'power':
-                U, S, Vh = svd_operator(A, AHA, inp_vec, rank=svd_rank, lobpcg=False, num_iter=num_iter)
-        
-        # Extract spatial and temporal factors
-        self.spatial_factors = (S[:svd_rank, None] ** 0.5) * Vh[:svd_rank, :]
-        self.spatial_factors = self.spatial_factors.reshape((svd_rank, *phis.shape[1:]))
-        self.temporal_factors = (S[:svd_rank, None] ** 0.5) * U[:, :svd_rank].T
-        self.temporal_factors = self.temporal_factors.reshape((svd_rank, *alphas.shape[1:]))
-        
-        # Normal operator
-        self.normal_factor = einsum(self.spatial_factors, S[:svd_rank] ** 0.5, 'L ..., L -> L ...')
-        
-        # Upsample if needed
-        if im_size_low is not None:
-            self.spatial_factors = spatial_resize_poly(self.spatial_factors, self.im_size, order=poly_order_img)
-        if trj_size_low is not None:
-            self.temporal_factors = spatial_resize_poly(self.temporal_factors, self.trj_size, order=poly_order_trj)
-            
-    def forward(self,
-                x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the matrix-vector operation.
-        
-        Args
-        ----
-        x : torch.Tensor
-            Input signal to be multiplied with the matrix with shape (N, *im_size)
-        
-        Returns
-        -------
-        y : torch.Tensor
-            Output signal with shape (N, *trj_size)
-        """
-        # consts
-        N = x.shape[0]
-            
-        # Perform the low-rank approximation
-        coeffs = einsum(x, self.spatial_factors, 'N ..., L ... -> N L')
-        y = einsum(coeffs, self.temporal_factors, 'N L, L ... -> N ...')
-        
-        return y
-
-    def adjoint(self,
-                y: torch.Tensor) -> torch.Tensor:
-        """
-        Adjoint pass of the matrix-vector operation.
-        
-        Args
-        ----
-        y : torch.Tensor
-            Output signal to be multiplied with the matrix with shape (N, *trj_size)
-            
-        Returns
-        -------
-        x : torch.Tensor
-            Input signal with shape (N, *im_size)
-        """
-        # Consts
-        N = y.shape[0]
-        
-        # Perform the low-rank approximation
-        coeffs = einsum(y, self.temporal_factors.conj(), 'N ..., L ... -> N L')
-        x = einsum(coeffs, self.spatial_factors.conj(), 'N L, L ... -> N ...')
-        
-        return x
-    
-    def normal(self,
-               x: torch.Tensor) -> torch.Tensor:
-        """
-        Normal pass of the matrix-vector operation.
-        
-        Args
-        ----
-        x : torch.Tensor
-            Input signal to be multiplied with the matrix with shape (N, *im_size)
-        """
-        coeffs = einsum(x, self.normal_factor, 'N ..., L ... -> N L')
-        return einsum(coeffs, self.normal_factor.conj(), 'N L, L ... -> N ...')
-    
+ 
 class matvec_cur(matvec):
 
     def __init__(self,
@@ -713,50 +569,62 @@ class matvec_cur(matvec):
                  rank_phi: Optional[int] = None,
                  rank_alpha: Optional[int] = None,
                  cluster_method: str = 'maxmin',
-                 spatial_batch_size: Optional[int] = None,
-                 temporal_batch_size: Optional[int] = None):
+                 normalize_method: str = 'svd',
+                 normalize_coeffs: Optional[bool] = None,
+                 seed: int = 0,
+                 **kwargs):
         """
         Args
         ----
         phis : torch.Tensor
-            Spatial phase maps with shape (B, *im_size)
+            Spatial phase maps with shape (B, *im_size). When S is given this
+            is V^T from A^T Φ = U Σ V^T.
         alphas : torch.Tensor
-            Temporal phase coefficients with shape (B, *trj_size)
-        cur_rank : int
-            CUR rank when rank_phi / rank_alpha are None
+            Temporal phase coefficients with shape (B, *trj_size). When S is
+            given this is U^T.
+        cur_rank : Optional[int]
+            < 0 uses adaptive-rank CUR; > 0 is the fixed CUR rank when
+            rank_phi / rank_alpha are None. None with no rank_phi/rank_alpha
+            also uses adaptive (legacy).
         rank_phi : Optional[int]
             number of spatial (phi) representatives
         rank_alpha : Optional[int]
             number of temporal (alpha) representatives
         cluster_method : str
             'maxmin' (default) or 'kmeans'
-        spatial_batch_size : Optional[int]
-            Spatial batch size for the matrix-vector operation.
-        temporal_batch_size : Optional[int]
-            Temporal batch size for the matrix-vector operation.
+        normalize_method : str
+            'rescale', 'cov', 'mahal', 'svd', or '' (no normalization)
+        normalize_coeffs : Optional[bool]
+            Deprecated. True → 'rescale', False → ''.
+        seed : int
+            RNG seed for the first maxmin pivot
         """
-        super(matvec_cur, self).__init__(phis, alphas, spatial_batch_size, temporal_batch_size)
+        super(matvec_cur, self).__init__(phis, alphas, **kwargs)
+        if normalize_coeffs is not None:
+            normalize_method = 'rescale' if normalize_coeffs else ''
 
         phis_flt = phis.reshape((self.B, -1))
         alphas_flt = alphas.reshape((self.B, -1))
         
-        if cur_rank is None and rank_phi is None and rank_alpha is None:
+        if (cur_rank is not None and cur_rank < 0) or (
+            cur_rank is None and rank_phi is None and rank_alpha is None
+        ):
             R, C, cur_rank = build_cur_factors_adaptive(
                 phis_flt, alphas_flt,
-                max_rank=1000,
-                min_rank=1,
-                tol=1e-3,
-                check_every=20,
-                n_val=2**11,
-                verbose=True
+                normalize_method=normalize_method,
+                cluster_method=cluster_method,
+                seed=seed,
+                verbose=True,
             )            
         else:
             R, C = build_cur_factors(
                 phis_flt, alphas_flt,
+                normalize_method=normalize_method,
                 rank=cur_rank,
                 rank_phi=rank_phi,
                 rank_alpha=rank_alpha,
                 cluster_method=cluster_method,
+                seed=seed,
             )
         K = R.shape[0]
         self.curR = R.reshape((K, *self.im_size))
@@ -830,148 +698,6 @@ class matvec_cur(matvec):
         coeffs = einsum(x, self.curR, 'N ..., K ... -> N K')
         coeffs = einsum(coeffs, self.normal_factor, 'N K, Ko K -> N Ko')
         return einsum(coeffs, self.curR.conj(), 'N K, K ... -> N ...')
-
-class matvec_histogram(matvec):
-    
-    def __init__(self, 
-                 phis: torch.Tensor, 
-                 alphas: torch.Tensor,
-                 dphi: Optional[float] = None,
-                 dalpha: Optional[float] = None,
-                 Kphi: Optional[int] = None,
-                 Kalpha: Optional[int] = None,
-                 Mphi: Optional[int] = None,
-                 Malpha: Optional[int] = None,
-                 **kwargs):
-        """
-        Args
-        ----
-        phis : torch.Tensor
-            Spatial phase maps with shape (B, *im_size)
-        alphas : torch.Tensor
-            Temporal phase coefficients with shape (B, *trj_size)
-        dphi : Optional[float]
-            phi quantization step size
-        dalpha : Optional[float]
-            alpha quantization step size
-        Kphi : Optional[int]
-            number of phi quantization bins for kmeans
-        Kalpha : Optional[int]
-            number of alpha quantization bins for kmeans
-        Mphi : Optional[int]
-            number of phi quantization bins for maxmin
-        Malpha : Optional[int]
-            number of alpha quantization bins for maxmin
-            
-        """
-        super(matvec_histogram, self).__init__(phis, alphas, **kwargs)
-        
-        # Quantize phis
-        phis_flt = phis.reshape((self.B, -1))
-        if dphi is not None or Kphi is not None:
-            if dphi is not None:
-                phis_quant, phis_inds = uniform_quantization(phis_flt, dphi)
-            elif Kphi is not None:
-                phis_quant, phis_inds = kmeans_quantization(phis_flt, Kphi)
-            elif Mphi is not None:
-                phis_quant, phis_inds = maxmin_quantization(phis_flt, Mphi)
-        else:
-            phis_quant = phis_flt
-            phis_inds = torch.arange(phis_quant.shape[1], device=phis_quant.device)
-        self.phis_inds = phis_inds
-        print(f'Phi reduction factor: {phis_flt.shape[1] / phis_quant.shape[1]:.2f}')
-            
-        # Quantize alphas
-        alphas_flt = alphas.reshape((self.B, -1))
-        if dalpha is not None or Kalpha is not None:
-            if dalpha is not None:
-                alphas_quant, alphas_inds = uniform_quantization(alphas_flt, dalpha)
-            elif Kalpha is not None:
-                alphas_quant, alphas_inds = kmeans_quantization(alphas_flt, Kalpha)
-            elif Malpha is not None:
-                alphas_quant, alphas_inds = maxmin_quantization(alphas_flt, Malpha)
-        else:
-            alphas_quant = alphas_flt
-            alphas_inds = torch.arange(alphas_quant.shape[1], device=alphas_quant.device)
-        self.alphas_inds = alphas_inds
-        print(f'Alpha reduction factor: {alphas_flt.shape[1] / alphas_quant.shape[1]:.2f}')
-        
-        # Make standard matvec on quantized coefficients
-        assert phis_quant.ndim == 2
-        assert alphas_quant.ndim == 2
-        self.matvec_quant = matvec_naive(phis_quant, alphas_quant, **kwargs)
-        
-    def forward(self,
-                x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the matrix-vector operation.
-        
-        Args
-        ----
-        x : torch.Tensor
-            Input signal to be multiplied with the matrix with shape (N, *im_size)
-        
-        Returns
-        -------
-        y : torch.Tensor
-            Output signal with shape (N, *trj_size)
-        """
-        # Consts
-        N = x.shape[0]
-        Kphi = self.matvec_quant.phis.shape[1]
-
-        # Flatten input
-        x_flt = x.reshape((N, -1))
-        
-        # Sum over voxels at equal quantization indices
-        idxs_rep = torch.repeat_interleave(self.phis_inds[None,], N, dim=0)
-        g = torch.zeros((N, Kphi), device=x.device, dtype=x.dtype)
-        g.scatter_add_(dim=1, index=idxs_rep, src=x_flt) # N kphi
-        
-        # Perform matrix-vector operation on quantized coefficients
-        y_quant = self.matvec_quant.forward(g) # N kalpha
-        
-        # Map back to trjsize with alpha indices
-        y = y_quant[:, self.alphas_inds].reshape((N, *self.trj_size))
-        
-        return y
-    
-    def adjoint(self,
-                y: torch.Tensor) -> torch.Tensor:
-        """
-        Adjoint pass of the matrix-vector operation.
-        
-        Args
-        ----
-        y : torch.Tensor
-            Output signal to be multiplied with the matrix with shape (N, *trj_size)
-        
-        Returns
-        -------
-        x : torch.Tensor
-            Input signal with shape (N, *im_size)
-        """
-        # Consts
-        N = y.shape[0]
-        Kalpha = self.matvec_quant.alphas.shape[1]
-        
-        # Flatten input
-        y_flt = y.reshape((N, -1))
-        
-        # Sum over alphas at equal quantization indices
-        idxs_rep = torch.repeat_interleave(self.alphas_inds[None,], N, dim=0)
-        g = torch.zeros((N, Kalpha), device=y.device, dtype=y.dtype)
-        g.scatter_add_(dim=1, index=idxs_rep, src=y_flt) # N kalpha
-        
-        # Perform matrix-vector operation on quantized coefficients
-        x_quant = self.matvec_quant.adjoint(g) # N kphi
-        
-        # Map back to imsize with phi indices
-        x = x_quant[:, self.phis_inds].reshape((N, *self.im_size))
-        
-        return x
-    
-    # TODO can technically make normal a bit faster
 
 class matvec_rnd(matvec):
     """
@@ -1056,7 +782,6 @@ class matvec_rnd(matvec):
         x = x_flt.reshape((N, *self.im_size))
         
         return x
-
 
 class matvec_rnd_fast(matvec):
     """

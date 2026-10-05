@@ -2,23 +2,16 @@ import gc
 import torch
 import numpy as np
 
-import matplotlib
-matplotlib.use('WebAgg')
-import matplotlib.pyplot as plt
+from time import perf_counter
 
-from mr_recon.fourier import sigpy_nufft
-from mr_recon.linops import sense_linop
 from mr_recon.recons import CG_SENSE_recon
-from mr_recon.imperfections.field import alpha_segementation
+from mr_recon.utils import cvplot
 
-from hofft.pipelines import hofft_decomp_linop, time_seg_decomp_linop
-from hofft.sparse_fit import sparse_params
-from hofft.matvec import matvec_cur
 from hofft.decomp import hofft_params
-from hofft.utils import expand_spatial, reduce_spatial
+from hofft.pipelines import svd_decomp_linop
 
 # Params
-L = 2
+L = 6
 
 # Load data
 torch_dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -39,67 +32,49 @@ trj = trj[:, :G//R]
 dcf = dcf[:, :G//R]
 ksp = ksp[:, :, :G//R]
 
-# B0 phase
+# B0 phase on the full trajectory grid
 ts = torch.arange(trj.shape[0], device=torch_dev) * 2e-6
 phis = b0[None,]
+# alphas = torch.zeros_like(dcf)
+# alphas[:] = ts[:, None, None]
+# alphas = alphas[None]
 alphas = ts[None, :, None, None]
 
-# # SENSE recon
-# nft = sigpy_nufft(im_size, width=3)
-# nft.beta = nft.optimal_beta(torch_dev=torch_dev)
-# phis_red = reduce_spatial(phis, (50,)*3)
-# bs, hs, _ = alpha_segementation(phis_red, alphas, L=L, interp_type='lstsq', use_type3=True)
-# bs = expand_spatial(bs, im_size)
-# A = sense_linop(trj, mps, dcf, 
-#                 spatial_funcs=bs,
-#                 temporal_funcs=hs,
-#                 nufft=nft)
-
-# HOFFT recon
-num_als_iter = 100
-hparams = hofft_params((3,)*3, 1.25, L,
-                        reduced_im_size=(50,)*3,
-                        spatial_init='seg',
-                        # spatial_init=f'500_alphas_{num_als_iter}',
-                        # matvec_kwargs={
-                        #     'temporal_batch_size': 2**12,
-                        # },
-                        # matvec_type=matvec_cur,
-                        # matvec_kwargs={
-                        #     'rank_phi': 500,
-                        #     'rank_alpha': 500,
-                        # },
-                        verbose=True)
+hparams = hofft_params(
+    (3,) * 3, 1.25, L,
+    reduced_im_size=(50,) * 3,
+    time_reduction_factor=10,
+    normalize_coeffs=True,
+    cur_rank=500,
+    verbose=True,
+)
 hparams.os = 2 * round(hparams.os * im_size[0] / 2) / im_size[0]
+decomp_kw = dict(phis=phis, alphas=alphas, mps=mps, trj=trj, dcf=dcf, hparams=hparams, use_sigpy=True)
 
-# A = time_seg_decomp_linop(phis, alphas, mps, trj, dcf=dcf,
-#                           normalize_coeffs=True,
-#                           use_sigpy=True,
-#                           hparams=hparams,)
 
-sparams = sparse_params(Q=500*5, S=16, 
-                        interp_type='inv_dist', 
-                        temporal_batch_size=2**15,
-                        spatial_subsample=2**15,
-                        num_validation=300)
-fact = 0 if 'alphas' in hparams.spatial_init else 1
-alphas = torch.zeros_like(dcf)
-alphas[:, ...] = ts[:, None, None]
-alphas = alphas[None, ...]
-A =  hofft_decomp_linop(phis, alphas, 
-                        mps=mps, trj=trj, dcf=dcf, 
-                        hparams=hparams, 
-                        sparams=sparams,
-                        normalize_coeffs=True,
-                        # spatial_mask=mask,
-                        num_als_iter=num_als_iter*fact,
-                        )
+def _time(fn):
+    if torch_dev.type == 'cuda':
+        torch.cuda.synchronize()
+    t0 = perf_counter()
+    out = fn()
+    if torch_dev.type == 'cuda':
+        torch.cuda.synchronize()
+    return perf_counter() - t0, out
 
-# Clear GPU memory
-gc.collect()
-torch.cuda.empty_cache()
 
-x0 = CG_SENSE_recon(A, ksp, max_iter=2, max_eigen=1.0)
+# Naive SVD: LOBPCG matvec on the downsampled phase (cur_rank cleared internally)
+# vs CUR-SVD of that same reduced phase matrix.
+imgs = {}
+# for label, svd_method in [('SVD (CUR)', 'cur'), ('SVD (naive)', 'lobpcg')]:
+# for label, svd_method in [('SVD (naive)', 'lobpcg'), ('SVD (CUR)', 'cur')]:
+for label, svd_method in [('SVD (naive)', 'direct'), ('SVD (CUR)', 'cur')]:
+    t_decomp, A = _time(lambda m=svd_method: svd_decomp_linop(**decomp_kw, svd_method=m))
+    t_recon, img = _time(lambda: CG_SENSE_recon(A, ksp, max_iter=2, max_eigen=1.0))
+    print(f'{label:<16s} decomp={t_decomp:.2f}s  recon={t_recon:.2f}s')
+    imgs[label] = img.cpu()
+    del A, img
+    gc.collect()
+    if torch_dev.type == 'cuda':
+        torch.cuda.empty_cache()
 
-from mr_recon.utils import cvplot
-cvplot('./config.yaml', x0)
+cvplot(None, **imgs)

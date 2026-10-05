@@ -1,7 +1,18 @@
 """
-Compare matvec_naive (GT) vs matvec_rnd / matvec_cur:
-NRMSE (vs naive) vs forward evaluation time on coco_spiral phis/alphas.
+Compare three approximations of the high-order phase matrix
+P[r,t] = exp(-j 2π φ(r) · α(t)) on coco_spiral:
+
+1. CUR without SVD whitening — cluster on the rescaled φ/α, P ≈ C R
+2. CUR with phase whitening — cluster in (Σ V^T, Σ U^T), P ≈ C_w R_w
+3. Spatial / temporal downsample by (Rn, Rm) — reconstruct via
+   φ'' = upsamp(downsamp(φ)), α'' = upsamp(downsamp(α))
+
+Accuracy is ||P - P_hat||_F^2 / ||P||_F^2 on a fixed random subset of
+spatial and temporal indices.
+Timing is the cheap apply: C R (or C_w R_w) for CUR, and
+exp(-j 2π φ' · α') on the downsampled grid for (3).
 """
+import gc
 import torch
 
 import matplotlib as mpl
@@ -9,13 +20,12 @@ mpl.use('webagg')
 import matplotlib.pyplot as plt
 
 from time import perf_counter
-from typing import Optional
-
+from tqdm import tqdm
 from einops import einsum
 
-from hofft.matvec import matvec_naive, matvec_rnd, matvec_cur, matvec_rnd_fast
-from hofft.phase_coeffs import rescale_phis_alphas, compress_phis_alphas
-from hofft.utils import reduce_spatial
+from hofft.matvec import matvec_naive, matvec_cur
+from hofft.phase_coeffs import rescale_phis_alphas, whiten_phis_alphas
+from hofft.utils import reduce_spatial, expand_spatial, reduce_temporal, expand_temporal
 
 
 class GPUTimer:
@@ -40,7 +50,6 @@ class GPUTimer:
             self.elapsed = perf_counter() - self._t0
         return False
 
-
 def time_repeated(fn, torch_dev, n_reps=5, reduction='median'):
     times = []
     result = None
@@ -52,9 +61,22 @@ def time_repeated(fn, torch_dev, n_reps=5, reduction='median'):
     elapsed = {'mean': times.mean, 'median': times.median, 'min': times.min}[reduction]().item()
     return elapsed, result
 
+def rel_frob_sq(P_hat: torch.Tensor, P_ref: torch.Tensor) -> float:
+    """||P - P_hat||_F^2 / ||P||_F^2 on the sampled block."""
+    return ((P_hat - P_ref).abs().square().sum() / P_ref.abs().square().sum()).item()
 
-def nrmse(y: torch.Tensor, y_ref: torch.Tensor) -> float:
-    return (torch.linalg.norm(y - y_ref) / torch.linalg.norm(y_ref)).item()
+
+def phase_block(phis, alphas, r_idx, t_idx) -> torch.Tensor:
+    """P[r_idx, t_idx] = exp(-j 2π φ(r) · α(t)), shape (n_s, n_t)."""
+    B = phis.shape[0]
+    phi_s = phis.reshape(B, -1)[:, r_idx]
+    alpha_t = alphas.reshape(B, -1)[:, t_idx]
+    return torch.exp(-2j * torch.pi * (phi_s.T @ alpha_t))
+
+
+def cur_block(R, C, r_idx, t_idx) -> torch.Tensor:
+    """P_hat[r, t] = sum_k R[k, r] C[k, t] on the sampled indices."""
+    return einsum(R[:, r_idx], C[:, t_idx], 'K Ns, K Nt -> Ns Nt')
 
 
 # ---------------------------------------------------------------------------
@@ -62,128 +84,181 @@ def nrmse(y: torch.Tensor, y_ref: torch.Tensor) -> float:
 # ---------------------------------------------------------------------------
 torch_dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.manual_seed(0)
-fpath = './data/coco_spiral'
+# fpath = './data/coco_spiral'
+fpath = './data/highres_spiral'
 kwargs = {'weights_only': True, 'map_location': torch_dev}
 
 phis = torch.load(f'{fpath}/phis.pt', **kwargs).float()
-alphas = torch.load(f'{fpath}/alphas.pt', **kwargs).float()
+alphas = torch.load(f'{fpath}/alphas.pt', **kwargs).float()[:, :, 0]
+evals = torch.load(f'{fpath}/evals.pt', **kwargs).float()
+mask = (evals > 0.9).float()
 
-# Downsample phis
-phis = reduce_spatial(phis, (100, 100), order=3)
-
-# Drop negligible bases
+# Remove low-energy bases
 B = phis.shape[0]
 energy = phis.reshape(B, -1).abs().mean(1) * alphas.reshape(B, -1).abs().mean(1)
 keep = torch.argwhere(energy > 1e-6)[:, 0]
 phis, alphas = phis[keep], alphas[keep]
 
-# Same rescale HOFFT uses before matvecs (relative approx quality is invariant
-# to global midpoint phases, so we ignore midpoints here).
-phis, _, alphas, _ = rescale_phis_alphas(phis, alphas, whiten=False)
-phis, alphas = compress_phis_alphas(phis, alphas, B_compressed=phis.shape[0])
+# # Compress
+# phis, alphas = whiten_phis_alphas(phis, alphas, B_compressed=10)
+# B = phis.shape[0]
+
+# Consts
+im_size = phis.shape[1:]
+trj_size = alphas.shape[1:]
+alphas = alphas.reshape(alphas.shape[0], -1)
+B, T = alphas.shape[0], alphas.shape[1]
+N = int(torch.tensor(im_size).prod().item())
 
 print(f'phis {tuple(phis.shape)}, alphas {tuple(alphas.shape)} on {torch_dev}')
 
-# Random input image (N=1 batch)
-x = torch.randn((1, *phis.shape[1:]), device=torch_dev, dtype=torch.complex64)
+x = torch.randn((1, *im_size), device=torch_dev, dtype=torch.complex64)
+n_reps = 10
+n_spatial = min(2048, N)
+n_temporal = min(2048, T)
+cur_ranks = [10, 25, 50, 100, 200, 400, 800]
+ds_factors = [(i,j) for i in range(1, 5) for j in range(10, 101, 30)]
 
-# Batch sizes keep naive's temporary R x T blocks manageable
-n_reps = 100
-
-# ---------------------------------------------------------------------------
-# Ground truth: matvec_naive
-# ---------------------------------------------------------------------------
-mv_naive = matvec_naive(
-    phis, alphas,
-)
-# Warmup
-_ = mv_naive(x)
-if torch_dev.type == 'cuda':
-    torch.cuda.synchronize()
-
-t_naive, y_ref = time_repeated(lambda: mv_naive(x), torch_dev, n_reps=n_reps)
-print(f'naive:  time={t_naive*1e3:.2f} ms')
+r_idx = torch.randperm(N, device=torch_dev)[:n_spatial]
+t_idx = torch.randperm(T, device=torch_dev)[:n_temporal]
+P_ref = phase_block(phis, alphas, r_idx, t_idx)
+print(f'error subset: {n_spatial} spatial x {n_temporal} temporal')
 
 results = {
-    'naive': {'times': [t_naive], 'nrmses': [0.0], 'labels': ['naive']},
-    'rnd': {'times': [], 'nrmses': [], 'labels': []},
-    'cur': {'times': [], 'nrmses': [], 'labels': []},
+    'cur': {'times': [], 'err_f2': [], 'labels': [], 'ranks': []},
+    'cur_white': {'times': [], 'err_f2': [], 'labels': [], 'ranks': []},
+    'downsample': {'times': [], 'err_f2': [], 'labels': [], 'Rn': [], 'Rm': []},
+    'N': N,
+    'T': T,
 }
-# ---------------------------------------------------------------------------
-# matvec_rnd sweep (forward uses rnd_frac_phis)
-# ---------------------------------------------------------------------------
-rnd_fracs = [0.01, 0.1, 0.5, 0.75]
-for frac in rnd_fracs:
-    mv = matvec_rnd_fast(phis, alphas, 
-                         rnd_frac_phis=frac, rnd_frac_alphas=frac)
-    _ = mv(x)
-    if torch_dev.type == 'cuda':
-        torch.cuda.synchronize()
-    # Average NRMSE over a few redraws; time a single forward (median of reps)
-    nrmses = []
-    for _rep in range(n_reps):
-        y = mv(x)
-        nrmses.append(nrmse(y, y_ref))
-    t, _ = time_repeated(lambda: mv(x), torch_dev, n_reps=n_reps)
-    err = sum(nrmses) / len(nrmses)
-    results['rnd']['times'].append(t)
-    results['rnd']['nrmses'].append(err)
-    results['rnd']['labels'].append(f'frac={frac:g}')
-    print(f'rnd frac={frac:<4g}: time={t*1e3:.2f} ms, NRMSE={err:.3e}')
 
 # ---------------------------------------------------------------------------
-# matvec_cur sweep
+# 1) CUR without phase whitening
 # ---------------------------------------------------------------------------
-cur_ranks = [10, 25, 50, 100, 200, 400, 800]
-for rank in cur_ranks:
-    mv = matvec_cur(phis, alphas, cur_rank=rank)
-    _ = mv(x)
+cluster_method = 'maxmin'
+for rank in tqdm(cur_ranks, desc='CUR (no whitening)'):
+    mv = matvec_cur(phis, alphas.reshape(B, T), cur_rank=rank, cluster_method=cluster_method, normalize_coeffs=False)
+    _ = mv.normal(x)
     if torch_dev.type == 'cuda':
         torch.cuda.synchronize()
-    t, y = time_repeated(lambda: mv(x), torch_dev, n_reps=n_reps)
-    err = nrmse(y, y_ref)
+    t, _ = time_repeated(lambda: mv.normal(x), torch_dev, n_reps=n_reps)
+    R = mv.curR.reshape(mv.curR.shape[0], -1)
+    C = mv.curC.reshape(mv.curC.shape[0], -1)
+    err = rel_frob_sq(cur_block(R, C, r_idx, t_idx), P_ref)
     results['cur']['times'].append(t)
-    results['cur']['nrmses'].append(err)
-    results['cur']['labels'].append(f'rank={rank}')
-    print(f'cur  rank={rank:<4d}: time={t*1e3:.2f} ms, NRMSE={err:.3e}')
+    results['cur']['err_f2'].append(err)
+    results['cur']['labels'].append(f'k={rank}')
+    results['cur']['ranks'].append(rank)
+    print(f'cur        k={rank:<4d}: time={t*1e3:.2f} ms, rel F^2={err:.4e}')
+    del R, C, mv
+    gc.collect()
+    torch.cuda.empty_cache()
+
+# ---------------------------------------------------------------------------
+# 2) CUR with phase whitening
+# ---------------------------------------------------------------------------
+for rank in tqdm(cur_ranks, desc='CUR (whitened)'):
+    mv = matvec_cur(phis, alphas.reshape(B, T), cur_rank=rank, cluster_method=cluster_method, normalize_coeffs=True,)
+    _ = mv.normal(x)
+    if torch_dev.type == 'cuda':
+        torch.cuda.synchronize()
+    t, _ = time_repeated(lambda: mv.normal(x), torch_dev, n_reps=n_reps)
+    R = mv.curR.reshape(mv.curR.shape[0], -1)
+    C = mv.curC.reshape(mv.curC.shape[0], -1)
+    err = rel_frob_sq(cur_block(R, C, r_idx, t_idx), P_ref)
+    results['cur_white']['times'].append(t)
+    results['cur_white']['err_f2'].append(err)
+    results['cur_white']['labels'].append(f'k={rank}')
+    results['cur_white']['ranks'].append(rank)
+    print(f'cur_white  k={rank:<4d}: time={t*1e3:.2f} ms, rel F^2={err:.4e}')
+    del R, C, mv
+    gc.collect()
+    torch.cuda.empty_cache()
+
+# ---------------------------------------------------------------------------
+# 3) Spatial / temporal downsample
+# ---------------------------------------------------------------------------
+for Rn, Rm in tqdm(ds_factors, desc='Downsample'):
+    im_low = tuple(max(2, s // Rn) for s in im_size)
+    T_low = max(2, trj_size[0] // Rm)
+    phis_ds = reduce_spatial(phis, im_low, order=3)
+    phis_up = expand_spatial(phis_ds, im_size, order=3)
+    alphas_reshaped = alphas.reshape(B, *trj_size)
+    alphas_ds = reduce_temporal(alphas_reshaped, T_low, dim=1, order=3)
+    alphas_up = expand_temporal(alphas_ds, trj_size[0], dim=1, order=3)
+    alphas_up = alphas_up.reshape(B, -1)
+    
+    x_ds = reduce_spatial(x, im_low, order=3)
+    mv = matvec_naive(phis_ds, alphas_ds)
+    _ = mv.normal(x_ds)
+    if torch_dev.type == 'cuda':
+        torch.cuda.synchronize()
+    t, _ = time_repeated(lambda: mv.normal(x_ds), torch_dev, n_reps=n_reps)
+    err = rel_frob_sq(phase_block(phis_up, alphas_up, r_idx, t_idx), P_ref)
+    results['downsample']['times'].append(t)
+    results['downsample']['err_f2'].append(err)
+    results['downsample']['labels'].append(f'Rn={Rn}, Rm={Rm}')
+    results['downsample']['Rn'].append(Rn)
+    results['downsample']['Rm'].append(Rm)
+    print(f'downsample Rn={Rn:<2d} Rm={Rm:<2d}: time={t*1e3:.2f} ms, '
+          f'rel F^2={err:.4e}  grid={im_low}+{T_low}')
+    del mv
+    gc.collect()
+    torch.cuda.empty_cache()
 
 # ---------------------------------------------------------------------------
 # Plot
 # ---------------------------------------------------------------------------
-fig, ax = plt.subplots(figsize=(7, 5))
-styles = {
-    'naive': dict(color='C0', marker='*', markersize=14, linestyle='none', label='naive'),
-    'rnd': dict(color='C1', marker='o', linestyle='-', label='rnd'),
-    'cur': dict(color='C2', marker='s', linestyle='-', label='cur'),
-}
-for key, style in styles.items():
+mpl.rcParams.update({
+    'font.size': 22,
+    'axes.titlesize': 24,
+    'axes.labelsize': 22,
+    'xtick.labelsize': 18,
+    'ytick.labelsize': 18,
+    'legend.fontsize': 14,
+    'axes.linewidth': 2.0,
+    'lines.linewidth': 4.0,
+    'lines.markersize': 14,
+    'figure.facecolor': 'white',
+    'axes.facecolor': 'white',
+})
+
+fig, ax = plt.subplots(figsize=(14, 7))
+cur_color = '#2ca02c'
+ds_color = '#ff7f0e'
+ds_linestyles = ['-', '--', '-.', ':']
+
+ax.plot(
+    [t * 1e3 for t in results['cur']['times']],
+    results['cur']['err_f2'],
+    color=cur_color, marker='s', linestyle='--', label='CUR',
+)
+ax.plot(
+    [t * 1e3 for t in results['cur_white']['times']],
+    results['cur_white']['err_f2'],
+    color=cur_color, marker='D', linestyle='-', label='CUR + whiten',
+)
+
+Rn_vals = sorted(set(results['downsample']['Rn']))
+for i, Rn in enumerate(Rn_vals):
+    idxs = [j for j, r in enumerate(results['downsample']['Rn']) if r == Rn]
+    idxs = sorted(idxs, key=lambda j: results['downsample']['Rm'][j])
     ax.plot(
-        [t * 1e3 for t in results[key]['times']],
-        results[key]['nrmses'],
-        **style,
+        [results['downsample']['times'][j] * 1e3 for j in idxs],
+        [results['downsample']['err_f2'][j] for j in idxs],
+        color=ds_color,
+        linestyle=ds_linestyles[i % len(ds_linestyles)],
+        marker='o',
+        label=fr'downsample $R_n$={Rn}',
     )
-    # Annotate sweep points lightly
-    if key != 'naive':
-        for t, e, lab in zip(results[key]['times'], results[key]['nrmses'], results[key]['labels']):
-            ax.annotate(lab, (t * 1e3, e), textcoords='offset points',
-                        xytext=(4, 4), fontsize=17, alpha=0.8)
-            
-# Vertical line for naive 
-ax.axvline(x=t_naive * 1e3, color='C0', linestyle='--', alpha=0.5)
-ax.annotate('naive', (t_naive * 1e3, 1e-6), textcoords='offset points',
-            xytext=(4, 4), fontsize=7, alpha=0.8)
-ax.set_xlabel('Forward time [ms]')
-ax.set_ylabel('NRMSE vs naive')
-ax.set_title('coco_spiral matvec: NRMSE vs forward time')
+
+ax.set_xlabel('Apply time [ms]')
+ax.set_ylabel(r'$\|P - \widehat{P}\|_F^2 / \|P\|_F^2$')
+ax.set_title('coco_spiral phase matrix: error vs apply time')
 ax.set_yscale('log')
 ax.set_xscale('log')
 ax.grid(True, which='both', alpha=0.3)
-# make lines thicker and markers bigger and text bigger
-for line in ax.lines:
-    line.set_linewidth(5)
-    line.set_markersize(10)
-ax.tick_params(axis='both', which='major', labelsize=24)
-# ax.legend()
+ax.legend()
 fig.tight_layout()
 
 out_png = './paper_experiments/matvec_analysis/nrmse_vs_time.png'

@@ -74,6 +74,7 @@ def densify_sparse_kernels(compressed_kernels: torch.Tensor,
 
     return kern_weights.reshape(L, *kern_size, *trj_size)
 
+
 class hofft_linop(linop):
 
     def __init__(self, 
@@ -277,7 +278,7 @@ class hofft_linop(linop):
             The response image with shape (*im_size)
         """
         return self.adjoint(self.forward(img))
-    
+
 class hofft_compressed_linop(linop):
     
     def __init__(self,
@@ -647,7 +648,7 @@ class expanded_encoding(linop):
         self.phis_flt = phis_flt
         self.dcf_flt = dcf.flatten()
         self.mps_flt = mps_flt
-        self.tbs = temporal_batch_size
+        self.tbs = temporal_batch_size if temporal_batch_size is not None else T
         self.verbose = verbose
 
     def forward(self,

@@ -14,9 +14,83 @@ Below we provide functions to express, resize, and process these phase coefficie
 import torch
 import numpy as np
 
+import matplotlib.pyplot as plt
+
 from typing import Optional
 from einops import einsum
 from .utils import gen_grd
+from .linalg import svd_product
+
+def visualize_alpha_space(phis: torch.Tensor,
+                          alphas: torch.Tensor,
+                          B_compressed: Optional[int] = None,
+                          npts_plot: int = 5000) -> None:
+    """
+    Visualize alpha space.
+    
+    Args
+    ----
+    phis : torch.Tensor
+        The spatial phase bases, shape (B, *im_size)
+    alphas : torch.Tensor
+        The temporal phase coefficients, shape (B, *trj_size)
+    B_compressed : Optional[int]
+        The number of bases to compress to, must be 2 or 3
+    npts_plot : int
+        The number of points to plot
+    """
+    # Consts
+    B = phis.shape[0]
+    
+    # Compress
+    if B_compressed is not None:
+        assert B_compressed in [2, 3], "B_compressed must be 2 or 3"
+        phis, alphas= whiten_phis_alphas(phis, alphas, B_compressed)
+        B = B_compressed
+    else:
+        assert B in [2, 3], "B must be 2 or 3 if B_compressed is not provided"
+        
+    # Grab random points to plot
+    alphas_flt = alphas.reshape((B, -1)).cpu()
+    rnd_inds = torch.randperm(alphas_flt.shape[1])[:npts_plot]
+    alphas_flt = alphas_flt[:, rnd_inds]
+    
+    # Normalize phis to range [-1/2, 1/2]
+    phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis.cpu(), alphas_flt, quantiles=(0.0, 1.0))
+    # alphas_nrm += alphas_mp[:, None]
+
+    
+    # Plot phis as images
+    if phis_nrm.ndim == 3:
+        slc = slice(None)
+    else:
+        slc = (slice(None), phis.shape[1]//2, slice(None))
+    plt.figure(figsize=(10, 5))
+    for b in range(B):
+        plt.subplot(1, B, b+1)
+        plt.imshow(phis_nrm[b][slc].rot90(), cmap='RdBu_r')
+        plt.colorbar()
+        plt.title(f'phi_{b}')
+        plt.axis('off')
+    plt.tight_layout()
+        
+    # Plot alpha scatter
+    if B == 2:
+        plt.figure(figsize=(10, 5))
+        plt.scatter(alphas_nrm[0], alphas_nrm[1], marker='.', alpha=0.2)
+        plt.tight_layout()
+        # plt.axis('equal')
+    if B == 3:
+        # 3D scatter
+        fig = plt.figure(figsize=(10, 5))
+        ax = fig.add_subplot(projection='3d')
+        ax.scatter(alphas_nrm[0], alphas_nrm[1], alphas_nrm[2], marker='.', alpha=0.2)
+        plt.tight_layout()
+        # plt.axis('equal')
+    # plt.xlim(-6, 6)
+    # plt.ylim(-6, 6)
+    # if B == 3:
+    #     plt.zlim(-6, 6)
 
 def coco_bases(x: torch.Tensor, 
                y: torch.Tensor, 
@@ -245,63 +319,36 @@ def trj_dev_to_phis_alphas(trj: torch.Tensor,
     
     return phis, alphas
 
-def whiten_phis_alphas(phis: torch.Tensor,
-                       alphas: torch.Tensor,
-                       B_compressed: Optional[int] = None) -> tuple[torch.Tensor, torch.Tensor]:
+def remove_empty_bases(phis: torch.Tensor,
+                       alphas: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Whitens the covariance matrix of the phi bases, and applies a similar transformation to the alpha coefficients to preserve total phase.
+    Remove empty bases from the phase coefficients.
     
     Args
     ----
     phis : torch.Tensor
-        Phase basis with shape (B, *im_size)
+        The spatial phase bases, shape (B, *im_size)
     alphas : torch.Tensor
-        Phase coefficients with shape (B, *trj_size)
-    B_compressed : Optional[int]
-        Number of compressed bases to use for whitening.
-        If None, all bases are used.
-
+        The temporal phase coefficients, shape (B, *trj_size)
+    
     Returns
     -------
-    phis_whitened : torch.Tensor
-        Whitened phase basis with shape (B, *im_size)
-    alphas_whitened : torch.Tensor
-        Whitened phase coefficients with shape (B, *trj_size)
+    phis : torch.Tensor
+        The spatial phase bases, shape (B_new, *im_size)
+    alphas : torch.Tensor
+        The temporal phase coefficients, shape (B_new, *trj_size)
     """
-    # Consts
-    im_size = phis.shape[1:]
     B = phis.shape[0]
-    R = np.prod(im_size)
-    assert B == alphas.shape[0]
-    if B_compressed is None:
-        B_compressed = B
-    
-    # Eigen decompose phis
-    cov_mat = einsum(phis, phis, 'B1 ..., B2 ... -> B1 B2') / R
-    evals, evecs = torch.linalg.eigh(cov_mat)
-    evecs = evecs[:, :B_compressed] # B B'
-    evals = evals[:B_compressed] # B'
-    
-    # Compute whitening matrix for phi, alpha
-    W_phi = (evals[:, None] ** -0.5) * evecs.T # B' B
-    W_alpha = (evals[:, None] ** +0.5) * evecs.T # B' B
-    
-    # Check that whitening is within tolerance
-    I = W_phi @ cov_mat @ W_phi.T
-    I_targ = torch.eye(B_compressed, device=phis.device, dtype=phis.dtype)
-    err = (I - I_targ).abs().max()
-    if err > 1e-4:
-        print(f'Warning: Whitening matrix is not exact, max|I - I_targ| error = {err:1.2e} > 1e-4')
-        
-    # Whiten
-    phis_whitened = einsum(W_phi, phis, 'Bc B, B ... -> Bc ...')
-    alphas_whitened = einsum(W_alpha, alphas, 'Bc B, B ... -> Bc ...')
-    
-    return phis_whitened, alphas_whitened
+    energy = (phis.reshape((B, -1)).abs().mean(dim=1)
+            * alphas.reshape((B, -1)).abs().mean(dim=1))
+    idxs = torch.argwhere(energy > 1e-6)[:, 0]
+    phis, alphas = phis[idxs], alphas[idxs]
+    return phis, alphas
 
 def rescale_phis_alphas(phis: torch.Tensor,
                         alphas: torch.Tensor,
-                        offset: str = 'midpoint') -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                        quantiles: tuple[float, float] = (0.0, 1.0),
+                        mask: Optional[torch.Tensor] = None,) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     f"""
     Phase model is 
     Phase = 2pi Alpha.T @ Phi 
@@ -346,46 +393,51 @@ def rescale_phis_alphas(phis: torch.Tensor,
     M = np.prod(trj_size)
     assert B == alphas.shape[0]
     
+    # Detault mask
+    if mask is None:
+        mask = torch.ones_like(phis[0])
+    
     # Flatten everything
     phis_flt = phis.reshape((B, N))
     alphas_flt = alphas.reshape((B, M))
+    mask = mask.reshape((N,))
     
-    # Compute offset terms
-    if offset == 'midpoint':
-        phis_ofs = (phis_flt.min(dim=1).values + phis_flt.max(dim=1).values)/2
-        alphas_ofs = (alphas_flt.min(dim=1).values + alphas_flt.max(dim=1).values)/2
-    elif offset == 'mean':
-        phis_ofs = phis_flt.mean(dim=1)
-        alphas_ofs = alphas_flt.mean(dim=1)
-    elif offset == 'median':
-        phis_ofs = phis_flt.median(dim=1).values
-        alphas_ofs = alphas_flt.median(dim=1).values
+    # phi = S * (phi + phis_ofs)
+    qs = torch.tensor(quantiles, device=phis_flt.device)
+    try:
+        plow, phigh = torch.quantile(phis_flt[:, mask > 0], q=qs, dim=1)
+    except:
+        phis_rnd = phis_flt[:, mask > 0]
+        rnd_inds = torch.randperm(phis_rnd.shape[1])[:10_000]
+        phis_rnd = phis_rnd[:, rnd_inds]
+        plow, phigh = torch.quantile(phis_rnd, q=qs, dim=1)
+    scales = (phigh - plow)
+    phis_ofs = (plow + phigh) / 2 / scales
     
     # Identify any indices with no spatial variation
-    idx_flat = torch.argwhere(phis_flt.std(dim=1) < 1e-6)[:, 0]
+    idx_flat = torch.argwhere((plow - phigh).abs() < 1e-6)[:, 0]
     phis_ofs[idx_flat] = 0.0
-    
-    # Centered phis and alphas
-    phis_flt_cent = phis_flt - phis_ofs[:, None]
-    alphas_flt_cent = alphas_flt - alphas_ofs[:, None]
+    scales[idx_flat] = plow[idx_flat]
     
     # Rescale phis to be between [-1/2, 1/2], or [0, 1] if no spatial variation
-    scales = phis_flt_cent.abs().max(dim=1).values * 2
-    scales[idx_flat] = phis_flt_cent[idx_flat].abs().max(dim=1).values
-    phis_ofs /= scales
-    phis_nrm = phis_flt_cent / scales[:, None]
-    alphas_ofs *= scales
-    alphas_nrm = alphas_flt_cent * scales[:, None]
+    phis_nrm = phis_flt / scales[:, None] - phis_ofs[:, None]
+    
+    # Carry scaling term into alpha
+    alphas_ofs = (alphas_flt * scales[:, None]).mean(dim=1)
+    alphas_nrm = (alphas_flt * scales[:, None]) - alphas_ofs[:, None]
         
     # Reshape and return
     return phis_nrm.reshape((B, *im_size)), phis_ofs, alphas_nrm.reshape((B, *trj_size)), alphas_ofs
 
 def whiten_phis_alphas(phis: torch.Tensor,
                        alphas: torch.Tensor,
-                       B_compressed: int = 5) -> tuple[torch.Tensor, torch.Tensor]:
+                       B_compressed: Optional[int] = None,
+                       return_singular_values: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    A = PHI.T @ ALPHA with shape (im_size, trj_size).
-    This function both whitens the PHI bases and finds the best rank-B_compressed approximation to A using SVD, efficiently.
+    Thin SVD of the total phase Φ A without forming the dense N×M matrix.
+
+        Φ A = U Σ V^H
+        returns Φ_w = U^T,  A_w = Σ V^H
     
     Args
     ----
@@ -398,10 +450,10 @@ def whiten_phis_alphas(phis: torch.Tensor,
         
     Returns
     -------
-    phis_compressed : torch.Tensor
-        The compressed spatial phase bases, shape (B_compressed, *im_size)
-    alphas_compressed : torch.Tensor
-        The compressed temporal phase coefficients, shape (B_compressed, *trj_size)
+    phis_w : torch.Tensor
+        U^T with shape (B_compressed, *im_size)
+    alphas_w : torch.Tensor
+        V^H with shape (B_compressed, *trj_size)
     """
     # Consts
     B = phis.shape[0]
@@ -410,35 +462,25 @@ def whiten_phis_alphas(phis: torch.Tensor,
     N = np.prod(im_size)
     M = np.prod(trj_size)
     assert B == alphas.shape[0]
+    if B_compressed is None:
+        B_compressed = B
     assert B_compressed <= B, "B_compressed must be less than or equal to B"
-    
-    # Flatten everything
-    A = alphas.reshape((B, M))
-    P = phis.reshape((B, N))
-    # Total phase = A.T @ P
-    
-    # QR decompose
-    # Total phase = Qa @ Ra @ Rp.T @ Qp.T
-    Qa, Ra = torch.linalg.qr(A.T, mode='reduced')
-    Qp, Rp = torch.linalg.qr(P.T, mode='reduced')
 
-    # SVD middle part such that (Ra @ Rp.T) = Um @ S @ Vm.T
-    # This happens on a BxB matrix, so it's extremely fast.
-    mid_mat = Ra @ Rp.T
-    Um, S, Vmt = torch.linalg.svd(mid_mat, full_matrices=False)
-    Vm = Vmt.T
-    
-    # Total phase = (Qa @ Um) @ S @ (Qp @ Vm).T
-    # Total phase = (   U   ) @ S @ (   V   ).T
-    U = Qa @ Um
-    V = Qp @ Vm
+    # Φ A with Φ : (N, B) and A : (B, M)
+    U, S, Vh = svd_product(phis.reshape((B, N)).mT,
+                           alphas.reshape((B, M)),
+                           rank=B_compressed)
+    phis_new = U.mT.reshape((B_compressed, *im_size))
+    alphas_new = Vh.reshape((B_compressed, *trj_size))
 
-    # Set Phi' = V.T / 2pi and  Alpha' = 2pi * S @ U.T
-    phis_new   = (V[:, :B_compressed]).T / (2 * torch.pi)
-    alphas_new = (U[:, :B_compressed] * S[:B_compressed]).T * 2 * torch.pi
-    
-    # Reshape and return
-    return phis_new.reshape((B_compressed, *im_size)), alphas_new.reshape((B_compressed, *trj_size))
+    # Return
+    if return_singular_values:
+        return phis_new, alphas_new, S
+    else:
+        p = 1
+        alphas_new = einsum(alphas_new, S ** p, 'B ..., B -> B ...')
+        phis_new = einsum(phis_new, S ** (1-p), 'B ..., B -> B ...')
+        return phis_new, alphas_new
 
 def apply_phase_midpoints(phis_nrm: torch.Tensor,
                           alphas_nrm: torch.Tensor,
@@ -483,3 +525,68 @@ def apply_phase_midpoints(phis_nrm: torch.Tensor,
     temporal_factors *= temporal_mp
     spatial_factors *= spatial_mp
     return spatial_factors, temporal_factors
+
+def remove_linear_terms(phis: torch.Tensor,
+                        alphas: torch.Tensor,
+                        mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Remove spatially linear terms from the phase coefficients.
+    
+    Args
+    ----
+    phis : torch.Tensor
+        The spatial phase bases, shape (B, *im_size)
+    alphas : torch.Tensor
+        The temporal phase coefficients, shape (B, *trj_size)
+    mask : Optional[torch.Tensor]
+        spatial mask with shape (*im_size)
+        
+    Returns
+    -------
+    phis_new : torch.Tensor
+        The spatial phase bases with linear terms removed, shape (B, *im_size)
+    trj_term : torch.Tensor
+        The temporal phase coefficients for removed linear terms, shape (*trj_size, d)
+    zeroth_order : torch.Tensor
+        The zeroth order phase offset, shape (*trj_size)
+    """
+    # Consts
+    im_size = phis.shape[1:]
+    trj_size = alphas.shape[1:]
+    d = len(im_size)
+    B = phis.shape[0]
+    N = np.prod(im_size)
+    
+    # Build linear bases
+    crds = gen_grd(im_size).to(phis.device)
+    
+    # Default mask
+    if mask is None:
+        mask = torch.ones_like(phis[0])
+    
+    # Least squares fit out linear terms
+    mask_flt = mask.reshape((N,)).float()[:, None]
+    Amat = crds.reshape((N, d))
+    Amat = torch.cat([(Amat[:, :1] * 0 + 1),
+                       Amat], dim=1) # offset term
+    Bmat = phis.reshape((B, N)).T
+    coeffs = torch.linalg.lstsq(Amat * mask_flt, 
+                                Bmat * mask_flt).solution # Shape (d+1, B)
+    
+    # Remove linear terms from phis
+    phis_hat = (Amat @ coeffs).T.reshape((B, *im_size))
+    phis_new = phis - phis_hat
+    
+    # Build alphas_lin
+    alphas_lin = torch.zeros((d+1, *trj_size), device=alphas.device, dtype=alphas.dtype)
+    for b in range(phis.shape[0]):
+        alphas_lin += einsum(coeffs[:, b], alphas[b], 'd, ... -> d ...') 
+        
+    # Split into zeroth order and trj term
+    zeroth_order = alphas_lin[0]
+    trj_term = alphas_lin[1:].moveaxis(0, -1)
+    
+    # Return
+    return phis_new, trj_term, zeroth_order
+        
+    

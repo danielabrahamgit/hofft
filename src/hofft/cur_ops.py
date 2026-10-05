@@ -18,9 +18,35 @@ from tqdm import tqdm
 from mr_recon.utils import pick_K_vectors
 from mr_recon.dtypes import complex_dtype
 
-from .phase_coeffs import rescale_phis_alphas
+from .phase_coeffs import rescale_phis_alphas, whiten_phis_alphas
+from .utils import maxmin_indices, maxmin_centroids, kmeans_centroids, fps_multi_center_indices
 
 ClusterMethod = Literal['maxmin', 'kmeans']
+NormalizeMethod = Literal['rescale', 'cov', 'mahal', 'svd', '']
+
+
+def _pivot_indices(coords: torch.Tensor,
+                   K: int,
+                   cluster_method: ClusterMethod,
+                   seed: Optional[int] = None) -> torch.Tensor:
+    """
+    Return K sample indices into ``coords`` of shape (N, B).
+
+    maxmin uses farthest-point picks (true sample indices). kmeans snaps each
+    centroid to its nearest sample so the CUR factors are built from actual
+    φ/α columns, not from interpolated centroid coordinates.
+    """
+    N = coords.shape[0]
+    if K >= N:
+        return torch.arange(N, device=coords.device)
+    if cluster_method == 'maxmin':
+        return maxmin_pivots(coords, K, seed=seed)
+    cents, _ = pick_K_vectors(coords, K=K, sigma=0, method=cluster_method,
+                              return_idxs=False)
+    cents_sq = (cents ** 2).sum(dim=-1)
+    coords_sq = (coords ** 2).sum(dim=-1)
+    d = cents_sq[:, None] + coords_sq[None, :] - 2 * (cents @ coords.T)
+    return d.argmin(dim=1)
 
 
 def setup_cur_phi_clusters(phis: torch.Tensor,
@@ -68,26 +94,187 @@ def cur_corr_slice(Dw: torch.Tensor,
     return cur_forward(Dw, R, C)
 
 
+def _prepare_cur_space(
+    phis: torch.Tensor,
+    alphas: torch.Tensor,
+    normalize_method: NormalizeMethod = 'svd',
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Shared CUR coordinate prep for ``build_cur_factors`` and
+    ``build_cur_factors_adaptive``.
+
+    Clustering is done in a metric where Euclidean distance approximates
+    phase error; R/C/W are formed from ``phis_full`` / ``alphas_full`` so
+    that ``phis_full[:, n] · alphas_full[:, t]`` equals the demeaned
+    (or rescaled) total phase. Midpoint / mean phase is factored into
+    the unit-modulus ``spat`` and ``temp`` corrections.
+
+    Returns
+    -------
+    phis_full : (B', N)
+        Spatial columns used to form C and W.
+    alphas_full : (B', T)
+        Temporal columns used to form R and W.
+    phis_pivot : (N, B')
+        Spatial coordinates for FPS / k-means.
+    alphas_pivot : (T, B')
+        Temporal coordinates for FPS / k-means.
+    spat : (N,)
+        Spatial midpoint correction.
+    temp : (T,)
+        Temporal midpoint correction.
+    """
+    B = phis.shape[0]
+
+    if normalize_method == 'rescale':
+        phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis, alphas)
+        phis_full = phis_nrm
+        alphas_full = alphas_nrm
+        phis_pivot = phis_nrm.T
+        alphas_pivot = alphas_nrm.T
+        spat = phis_nrm.T @ alphas_mp
+        temp = alphas_nrm.T @ phis_mp
+        temp = temp + alphas_mp @ phis_mp
+        spat = torch.exp(-2j * torch.pi * spat)
+        temp = torch.exp(-2j * torch.pi * temp)
+
+    elif normalize_method == 'cov':
+        phi0 = phis.mean(dim=1)
+        alpha0 = alphas.mean(dim=1)
+        phis_demean = phis - phi0[:, None]
+        alphas_demean = alphas - alpha0[:, None]
+        spat = phis_demean.T @ alpha0
+        temp = alphas_demean.T @ phi0
+        temp = temp + alpha0 @ phi0
+        spat = torch.exp(-2j * torch.pi * spat)
+        temp = torch.exp(-2j * torch.pi * temp)
+        phis_full = phis_demean
+        alphas_full = alphas_demean
+        PPT = phis_demean @ phis_demean.T
+        AAT = alphas_demean @ alphas_demean.T
+        P_eigvals, P_eigvecs = torch.linalg.eigh(PPT)
+        A_eigvals, A_eigvecs = torch.linalg.eigh(AAT)
+        P_scale = P_eigvals.clamp_min(P_eigvals.max() * 1e-8).rsqrt()
+        A_scale = A_eigvals.clamp_min(A_eigvals.max() * 1e-8).rsqrt()
+        phis_nrm = (P_scale[:, None] * P_eigvecs.T) @ phis_demean
+        alphas_nrm = (A_scale[:, None] * A_eigvecs.T) @ alphas_demean
+        phis_pivot = phis_nrm.T
+        alphas_pivot = alphas_nrm.T
+
+    elif normalize_method == 'mahal':
+        phi0 = phis.mean(dim=1)
+        alpha0 = alphas.mean(dim=1)
+        phis_demean = phis - phi0[:, None]
+        alphas_demean = alphas - alpha0[:, None]
+        spat = phis_demean.T @ alpha0
+        temp = alphas_demean.T @ phi0
+        temp = temp + alpha0 @ phi0
+        spat = torch.exp(-2j * torch.pi * spat)
+        temp = torch.exp(-2j * torch.pi * temp)
+
+        # sum_n |e^{-j2π Δα · φ(r_n)}|^2 ≈ Δα^T (Φ Φ^T) Δα.
+        # W_φ (Φ Φ^T) W_φ^T = I  ⇒  Euclidean FPS on α' = W_φ^{-T} α.
+        # Dual: Euclidean FPS on φ' = W_α^{-T} φ. CUR uses φ'' = W_φ φ,
+        # α' = W_φ^{-T} α so φ'' · α' = φ · α.
+        def _gram_whiten(X):
+            evals, evecs = torch.linalg.eigh(X @ X.T)
+            lam = evals.clamp_min(evals.max() * 1e-8)
+            W = lam.rsqrt()[:, None] * evecs.T
+            W_inv_T = lam.sqrt()[:, None] * evecs.T
+            return W, W_inv_T
+
+        W_phi, W_phi_inv_T = _gram_whiten(phis_demean)
+        _, W_alpha_inv_T = _gram_whiten(alphas_demean)
+        phis_full = W_phi @ phis_demean
+        alphas_full = W_phi_inv_T @ alphas_demean
+        phis_pivot = (W_alpha_inv_T @ phis_demean).T
+        alphas_pivot = alphas_full.T
+
+    elif normalize_method == 'svd':
+        phi0 = phis.mean(dim=1)
+        alpha0 = alphas.mean(dim=1)
+        phis_demean = phis - phi0[:, None]
+        alphas_demean = alphas - alpha0[:, None]
+        spat = phis_demean.T @ alpha0
+        temp = alphas_demean.T @ phi0
+        temp = temp + alpha0 @ phi0
+        spat = torch.exp(-2j * torch.pi * spat)
+        temp = torch.exp(-2j * torch.pi * temp)
+        phis_nrm, alphas_nrm, S = whiten_phis_alphas(
+            phis_demean, alphas_demean,
+            B_compressed=B, return_singular_values=True,
+        )
+        phis_full = phis_nrm
+        alphas_full = (alphas_nrm.T * S).T
+        phis_pivot = phis_nrm.T * S
+        alphas_pivot = alphas_nrm.T * S
+
+    elif normalize_method == '':
+        phis_full = phis
+        alphas_full = alphas
+        phis_pivot = phis_full.T
+        alphas_pivot = alphas_full.T
+        spat = torch.exp(-2j * torch.pi * phis[0] * 0)
+        temp = torch.exp(-2j * torch.pi * alphas[0] * 0)
+
+    else:
+        raise ValueError(
+            f"Unknown normalize_method {normalize_method!r}. "
+            "Expected one of 'rescale', 'cov', 'mahal', 'svd', ''."
+        )
+
+    return phis_full, alphas_full, phis_pivot, alphas_pivot, spat, temp
+
+
+def _cur_factors_from_pivots(phis_full: torch.Tensor,
+                             alphas_full: torch.Tensor,
+                             phi_idxs: torch.Tensor,
+                             alpha_idxs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """CUR R, C (no midpoint correction) from pivot indices. Same pinv as build_cur_factors."""
+    phi_clusts = phis_full.T[phi_idxs]
+    alpha_clusts = alphas_full.T[alpha_idxs]
+    R = torch.exp(-2j * torch.pi * (alpha_clusts @ phis_full))
+    C = torch.exp(-2j * torch.pi * (phi_clusts @ alphas_full))
+    W = torch.exp(-2j * torch.pi * (alpha_clusts @ phi_clusts.T))
+    R = einsum(torch.linalg.pinv(W), R, 'Kp Ka, Ka N -> Kp N')
+    return R, C
+
+
+def _cur_heldout_rel_err(phis_full: torch.Tensor,
+                         alphas_full: torch.Tensor,
+                         phi_idxs: torch.Tensor,
+                         alpha_idxs: torch.Tensor,
+                         r_val: torch.Tensor,
+                         t_val: torch.Tensor,
+                         phi_true: torch.Tensor) -> torch.Tensor:
+    """Relative L2 error of pinv-CUR on held-out (r, t) entries of the unit-modulus phase."""
+    phi_clusts = phis_full.T[phi_idxs]
+    alpha_clusts = alphas_full.T[alpha_idxs]
+    R_raw = torch.exp(-2j * torch.pi * (alpha_clusts @ phis_full[:, r_val]))
+    C = torch.exp(-2j * torch.pi * (phi_clusts @ alphas_full[:, t_val]))
+    W = torch.exp(-2j * torch.pi * (alpha_clusts @ phi_clusts.T))
+    approx = einsum(torch.linalg.pinv(W) @ R_raw, C, 'k n, k n -> n')
+    return (approx - phi_true).norm() / phi_true.norm()
+
+
 def build_cur_factors(phis: torch.Tensor,
                       alphas: torch.Tensor,
                       rank: int = 128,
                       rank_phi: Optional[int] = None,
                       rank_alpha: Optional[int] = None,
                       cluster_method: ClusterMethod = 'maxmin',
+                      normalize_method: NormalizeMethod = 'svd',
+                      seed: int = 0,
                       ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Build CUR factors so Phi[r,t] ≈ sum_k R[k,r] C[k,t].
 
-    Uses rescale_phis_alphas + representative row/column clusters.  Asymmetric
-    ranks (rank_phi for spatial reps, rank_alpha for temporal reps) can reduce
-    total K while preserving accuracy when spatial and temporal complexity differ.
-
     Args
     ----
     phis : torch.Tensor
-        (B, R) spatial phase coefficients
+        (B, R) spatial phase coefficients (V^T when S is given)
     alphas : torch.Tensor
-        (B, T) temporal phase coefficients
+        (B, T) temporal phase coefficients (U^T when S is given)
     rank : int
         default rank when rank_phi / rank_alpha are None
     rank_phi : Optional[int]
@@ -96,6 +283,16 @@ def build_cur_factors(phis: torch.Tensor,
         number of temporal (alpha) representatives
     cluster_method : str
         'maxmin' (default, better coverage) or 'kmeans'
+    normalize_method : Literal['rescale', 'cov', 'mahal', 'svd', '']
+        Method to normalize the coefficients:
+        - 'rescale': rescale so phis are in [-1/2, 1/2]
+        - 'cov': ZCA-whiten each side with its own Gram (pivot metric only)
+        - 'mahal': first-order phase-error metric. W_φ (ΦΦᵀ) W_φᵀ = I,
+          α' = W_φ^{-T} α (and the dual for φ); CUR in the W_φ pair
+        - 'svd': joint SVD of A^T Φ; cluster in the whitened plane
+        - '': no normalization
+    seed : int
+        RNG seed for the first maxmin pivot (same seed ⇒ same start index)
 
     Returns
     -------
@@ -104,45 +301,17 @@ def build_cur_factors(phis: torch.Tensor,
     C : torch.Tensor
         (K, T) with K = rank_phi  (same K index couples R and C via U)
     """
-    # Consts
-    B, R = phis.shape
-    T = alphas.shape[1]
     Ka = rank_alpha if rank_alpha is not None else rank
     Kp = rank_phi if rank_phi is not None else rank
-    
-    # Rescale: maxmin/clustering distance uses the normalized (per-order
-    # equalized) coords; phase exponentials use the full phis_nrm+phis_mp
-    # affine coords. Using raw coeffs for clustering lets the largest-magnitude
-    # phase order dominate farthest-point distance, picking near-duplicate
-    # pivots along smaller (but still phase-relevant) orders -- see
-    # build_cur_factors_adaptive for why this matters more there.
-    phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis, alphas)
-    phis_full = phis_nrm + phis_mp[:, None]
-    alphas_full = alphas_nrm + alphas_mp[:, None]
 
-    # Cluster alphas
-    if Ka >= T:
-        alpha_clusts = alphas_nrm.T
-    else:
-        alpha_clusts, _ = pick_K_vectors(
-            alphas_nrm.T, K=Ka, sigma=0, method=cluster_method)
-    alpha_clusts = alpha_clusts + alphas_mp
-    
-    # Cluster phis
-    if Kp >= R:
-        phi_clusts = phis_nrm.T
-    else:
-        phi_clusts, _ = pick_K_vectors(
-            phis_nrm.T, K=Kp, sigma=0, method=cluster_method)
-    phi_clusts = phi_clusts + phis_mp
+    phis_full, alphas_full, phis_pivot, alphas_pivot, spat, temp = _prepare_cur_space(
+        phis, alphas, normalize_method)
 
-    # Compute R and C
-    R_raw = torch.exp(-2j * torch.pi * (alpha_clusts @ phis_full))   # (Ka, R)
-    C = torch.exp(-2j * torch.pi * (phi_clusts @ alphas_full))       # (Kp, T)
-
-    W = torch.exp(-2j * torch.pi * (alpha_clusts @ phi_clusts.T))    # (Ka, Kp)
-    U = torch.linalg.pinv(W)                                           # (Kp, Ka)
-    R = einsum(U, R_raw, 'Kp Ka, Ka R -> Kp R')
+    phi_idxs = _pivot_indices(phis_pivot, Kp, cluster_method, seed=seed)
+    alpha_idxs = _pivot_indices(alphas_pivot, Ka, cluster_method, seed=seed)
+    R, C = _cur_factors_from_pivots(phis_full, alphas_full, phi_idxs, alpha_idxs)
+    R = einsum(R, spat, 'Kp N, N -> Kp N')
+    C = einsum(C, temp, 'Kp M, M -> Kp M')
     return R, C
 
 
@@ -151,10 +320,9 @@ def maxmin_pivots(vectors: torch.Tensor,
                   seed: Optional[int] = None) -> torch.Tensor:
     """
     Greedy farthest-point (maxmin) pivot selection, returning indices in the
-    order they were picked. Since the picks are incremental, the first k
-    indices of a K-pivot call equal a standalone k-pivot call given the same
-    seed -- this nesting is what lets build_cur_factors_adaptive grow rank
-    one pivot at a time instead of resampling per candidate rank.
+    order they were picked. The first k indices of a K-pivot call equal a
+    standalone k-pivot call with the same seed, so adaptive rank search can
+    reuse one maxmin run and take prefixes.
 
     Args
     ----
@@ -171,64 +339,44 @@ def maxmin_pivots(vectors: torch.Tensor,
     gen = torch.Generator(device=vectors.device)
     if seed is not None:
         gen.manual_seed(seed)
-    picked = [int(torch.randint(0, N, (1,), generator=gen, device=vectors.device))]
-    dist = torch.linalg.norm(vectors - vectors[picked[-1]], dim=-1)
-    for _ in range(1, K):
-        nxt = int(torch.argmax(dist))
-        picked.append(nxt)
+    # Keep indices on device: int(argmax)/int(randint) would sync every pivot.
+    picked = torch.empty(K, dtype=torch.long, device=vectors.device)
+    picked[0] = torch.randint(0, N, (), generator=gen, device=vectors.device)
+    dist = torch.linalg.norm(vectors - vectors[picked[0]], dim=-1)
+    for k in range(1, K):
+        nxt = dist.argmax()
+        picked[k] = nxt
         dist = torch.minimum(dist, torch.linalg.norm(vectors - vectors[nxt], dim=-1))
-    return torch.tensor(picked, dtype=torch.long, device=vectors.device)
-
-
-def _border_inverse(V: torch.Tensor,
-                    b: torch.Tensor,
-                    c: torch.Tensor,
-                    d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Extend inv(W_r) = V (r, r) to inv(W_{r+1}) given the new column `b` (r,),
-    new row `c` (r,), and corner `d` (scalar), via the Schur-complement
-    bordering update -- O(r^2) instead of an O(r^3) pinv from scratch.
-
-    Returns (V_new, s), where s is the Schur complement: small |s| means the
-    new pivot is nearly linearly dependent on the existing ones (cheap
-    rank-sufficiency signal, analogous to a decaying pivot in rank-revealing
-    LU/QR).
-    """
-    Vb = V @ b
-    cV = c @ V
-    s = d - c @ Vb
-    r = V.shape[0]
-    V_new = torch.empty((r + 1, r + 1), dtype=V.dtype, device=V.device)
-    V_new[:r, :r] = V + torch.outer(Vb, cV) / s
-    V_new[:r, r] = -Vb / s
-    V_new[r, :r] = -cV / s
-    V_new[r, r] = 1.0 / s
-    return V_new, s
+    return picked
 
 
 def build_cur_factors_adaptive(phis: torch.Tensor,
                                alphas: torch.Tensor,
                                max_rank: int = 1000,
-                               min_rank: int = 100,
-                               tol: float = 1e-3,
-                               check_every: int = 8,
+                               min_rank: int = 16,
+                               tol: float = 1e-2,
+                               check_every: int = 16,
                                n_val: int = 2048,
-                               resid_tol: float = 1e-2,
                                seed: int = 0,
                                verbose: bool = False,
+                               normalize_method: NormalizeMethod = 'svd',
+                               cluster_method: ClusterMethod = 'maxmin',
+                               normalize_coeffs: Optional[bool] = None,
                                ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """
-    Adaptive-rank CUR: grow a square pivot set (rank_alpha = rank_phi = r) one
-    maxmin pivot at a time, maintaining U = inv(W_r) via the Schur-complement
-    bordering update in `_border_inverse` instead of an independent
-    torch.linalg.pinv per candidate rank. Reconstruction error against a
-    held-out sample of Phi entries is checked every `check_every` pivots;
-    growth stops as soon as that error is below `tol` (or at `max_rank`, or if
-    a new pivot turns out to be numerically dependent on prior ones).
+    Smallest square CUR rank whose held-out phase error is below ``tol``.
 
-    Cost to reach the final rank r* is O(r*^3) total -- the same as a single
-    pinv at r* -- versus O(r*^4) for independently re-inverting W at O(r*)
-    candidate ranks.
+    Uses the same ``normalize_method`` / pivot metric / ``pinv(W)`` construction
+    as ``build_cur_factors``, so the rank that meets ``tol`` is the rank at
+    which ``build_cur_factors(..., rank=r)`` would meet it. Each candidate
+    rank is built from scratch (no incremental inverse), which removes the
+    Schur-complement drift that used to make the error-vs-rank curve
+    unreliable.
+
+    Search: evaluate every ``check_every`` ranks from ``min_rank`` until the
+    error drops below ``tol`` (or ``max_rank``), then binary-search that last
+    window for the smallest passing rank. maxmin pivots are nested, so one
+    FPS run is reused as prefixes. kmeans re-clusters at each evaluated rank.
 
     Args
     ----
@@ -237,29 +385,25 @@ def build_cur_factors_adaptive(phis: torch.Tensor,
     alphas : torch.Tensor
         (B, T) temporal phase coefficients
     max_rank : int
-        largest rank to grow to before giving up
+        largest rank to try
     min_rank : int
-        skip the sequential bordering (and all error checks) below this rank
-        by building inv(W_min_rank) directly with one torch.linalg.inv call,
-        then bordering up from there. Same FLOP count as growing from rank 1,
-        but avoids min_rank-1 sequential Python-level steps -- use this when
-        you already know the useful rank is well above 1.
+        smallest rank to try
     tol : float
         relative L2 error on held-out Phi entries that stops growth
     check_every : int
-        how often (in pivots) to evaluate the held-out error
+        coarse stride before the binary refinement
     n_val : int
         number of held-out (r, t) entries used for the error estimate
-    resid_tol : float
-        max|inv(W_r) @ W_r - I| tolerance checked at each checkpoint; once
-        exceeded, the unregularized bordering recursion has drifted too far
-        to trust, so V is re-grounded with a fresh torch.linalg.pinv(W_r)
-        (regularized, like build_cur_factors uses at every rank) and growth
-        continues from there instead of stopping
     seed : int
-        seed for maxmin pivot selection and held-out sampling
+        seed for pivot selection and held-out sampling
     verbose : bool
-        print rank/error progress
+        print rank / error at each evaluation
+    normalize_method : {'rescale', 'cov', 'mahal', 'svd', ''}
+        Same options as ``build_cur_factors``
+    cluster_method : {'maxmin', 'kmeans'}
+        Same options as ``build_cur_factors``
+    normalize_coeffs : Optional[bool]
+        Deprecated. True → 'rescale', False → ''.
 
     Returns
     -------
@@ -268,137 +412,94 @@ def build_cur_factors_adaptive(phis: torch.Tensor,
     C : torch.Tensor
         (K, T) with K = rank_used
     rank_used : int
-        rank at which growth stopped
+        smallest rank whose held-out error is below ``tol``, or ``max_rank``
     """
-    # Consts
-    B, Rdim = phis.shape
+    if normalize_coeffs is not None:
+        normalize_method = 'rescale' if normalize_coeffs else ''
+
+    N = phis.shape[1]
     T = alphas.shape[1]
     torch_dev = phis.device
-    max_rank = min(max_rank, Rdim, T)
+    max_rank = min(max_rank, N, T)
     min_rank = max(1, min(min_rank, max_rank))
+    check_every = max(1, check_every)
 
-    # Rescale: maxmin pivot order is built from the normalized (per-order
-    # equalized) coords -- using raw coeffs here lets the largest-magnitude
-    # phase order dominate farthest-point distance, so maxmin repeatedly
-    # picks near-duplicate pivots along smaller (but still phase-relevant)
-    # orders. That makes W severely ill-conditioned as rank grows, and since
-    # this pivot order is nested/seeded (unlike build_cur_factors' fresh
-    # per-call draw), one bad early pivot corrupts every higher rank instead
-    # of being averaged out.
-    phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis, alphas)
-    phis_full = phis_nrm + phis_mp[:, None]
-    alphas_full = alphas_nrm + alphas_mp[:, None]
+    phis_full, alphas_full, phis_pivot, alphas_pivot, spat, temp = _prepare_cur_space(
+        phis, alphas, normalize_method)
 
-    # Ordered maxmin pivots, grown incrementally
-    phi_order = maxmin_pivots(phis_nrm.T, max_rank, seed=seed)
-    alpha_order = maxmin_pivots(alphas_nrm.T, max_rank, seed=seed + 1)
-    phi_clusts_all = phis_nrm.T[phi_order] + phis_mp        # (max_rank, B)
-    alpha_clusts_all = alphas_nrm.T[alpha_order] + alphas_mp  # (max_rank, B)
+    # Nested maxmin prefixes; kmeans has no nesting so it is re-run per rank.
+    if cluster_method == 'maxmin':
+        phi_idxs_all = _pivot_indices(phis_pivot, max_rank, cluster_method, seed=seed)
+        alpha_idxs_all = _pivot_indices(alphas_pivot, max_rank, cluster_method, seed=seed)
+    else:
+        phi_idxs_all = alpha_idxs_all = None
 
-    # Held-out (r, t) entries of Phi for a cheap error estimate
+    def pivots_at(r: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if phi_idxs_all is not None:
+            return phi_idxs_all[:r], alpha_idxs_all[:r]
+        return (
+            _pivot_indices(phis_pivot, r, cluster_method, seed=seed),
+            _pivot_indices(alphas_pivot, r, cluster_method, seed=seed),
+        )
+
     gen = torch.Generator(device=torch_dev)
     gen.manual_seed(seed + 2)
-    r_val = torch.randint(0, Rdim, (n_val,), generator=gen, device=torch_dev)
+    r_val = torch.randint(0, N, (n_val,), generator=gen, device=torch_dev)
     t_val = torch.randint(0, T, (n_val,), generator=gen, device=torch_dev)
     phi_true = torch.exp(-2j * torch.pi * einsum(
         phis_full[:, r_val], alphas_full[:, t_val], 'b n, b n -> n'))
 
-    V = None
-    rank_used = max_rank
-    errs = []
-    resids = []
-    for r in tqdm(range(min_rank, max_rank + 1), desc='Sweeping CUR Rank'):
-        if V is None:
-            # First rank we actually build -- either r=1 (default) or the
-            # requested min_rank, computed in one shot rather than bordered
-            # up from scratch.
-            phi_r_full = phi_clusts_all[:r]
-            alpha_r_full = alpha_clusts_all[:r]
-            W_r = torch.exp(-2j * torch.pi * (alpha_r_full @ phi_r_full.T))
-            V = torch.linalg.inv(W_r)
-            resid = (V @ W_r - torch.eye(r, dtype=W_r.dtype, device=W_r.device)).abs().max()
-            if resid > 1e-3:
-                print(f'Warning: build_cur_factors_adaptive: W at min_rank={r} is '
-                     f'poorly conditioned (max|inv(W) @ W - I|={resid.item():.2e}); '
-                     f'the true rank may be below min_rank. Growth from here on is '
-                     f'unprotected by the near-dependent-pivot check that ranks below '
-                     f'min_rank would have gotten -- consider lowering min_rank.')
-        else:
-            phi_r = phi_clusts_all[r - 1:r]      # (1, B)
-            alpha_r = alpha_clusts_all[r - 1:r]  # (1, B)
-            phi_prev = phi_clusts_all[:r - 1]
-            alpha_prev = alpha_clusts_all[:r - 1]
-            b = torch.exp(-2j * torch.pi * (alpha_prev @ phi_r.T)).squeeze(-1)
-            c = torch.exp(-2j * torch.pi * (alpha_r @ phi_prev.T)).squeeze(0)
-            d = torch.exp(-2j * torch.pi * (alpha_r @ phi_r.T)).reshape(())
-            V_new, s = _border_inverse(V, b, c, d)
-            if s.abs() < 1e-10:
-                rank_used = r - 1
-                if verbose:
-                    print(f'stopping at rank {rank_used}: pivot {r} '
-                         f'nearly dependent (|s|={s.abs().item():.2e})')
-                break
-            V = V_new
+    err_cache: dict[int, float] = {}
 
-        if r % check_every == 0 or r == max_rank or r == min_rank:
-            alpha_r_full = alpha_clusts_all[:r]
-            phi_r_full = phi_clusts_all[:r]
-
-            # The Schur-complement recursion has no regularization (unlike
-            # pinv's implicit small-singular-value truncation), so floating
-            # point error compounds once maxmin runs out of genuinely new,
-            # well-separated pivots and W_r starts to become ill-conditioned.
-            # Catch that drift via the residual rather than trusting a fixed
-            # |s| threshold (by the time |s| is tiny, V is already far gone).
-            # Instead of rolling back and stopping growth (which left this
-            # method far less accurate at a given rank than build_cur_factors,
-            # which uses pinv at every rank), re-ground with a fresh
-            # regularized pinv(W_r) and keep growing from there -- this costs
-            # one O(r^3) SVD, but only at checkpoints where drift is actually
-            # detected, so it stays much cheaper than pinv-per-rank while
-            # matching pinv's accuracy exactly where plain inversion breaks
-            # down.
-            W_r_chk = torch.exp(-2j * torch.pi * (alpha_r_full @ phi_r_full.T))
-            resid = (V @ W_r_chk - torch.eye(r, dtype=V.dtype, device=V.device)).abs().max()
-            if resid > resid_tol:
-                V = torch.linalg.pinv(W_r_chk)
-                if verbose:
-                    print(f'rank {r}: numerical drift detected '
-                         f'(max|inv(W)@W - I|={resid.item():.2e} > {resid_tol}); '
-                         f're-grounding with pinv(W)')
-
-            R_raw_val = torch.exp(-2j * torch.pi * (alpha_r_full @ phis_full[:, r_val]))  # (r, n_val)
-            C_val = torch.exp(-2j * torch.pi * (phi_r_full @ alphas_full[:, t_val]))      # (r, n_val)
-            R_val = V @ R_raw_val
-            phi_approx = einsum(R_val, C_val, 'k n, k n -> n')
-            err = torch.linalg.norm(phi_approx - phi_true) / torch.linalg.norm(phi_true)
+    def err_at(r: int) -> float:
+        if r not in err_cache:
+            phi_idxs, alpha_idxs = pivots_at(r)
+            err = _cur_heldout_rel_err(
+                phis_full, alphas_full, phi_idxs, alpha_idxs,
+                r_val, t_val, phi_true,
+            )
+            err_cache[r] = err.item()
             if verbose:
-                print(f'rank {r}: rel err {err.item():.3e} (residual {resid.item():.2e})')
-            if err < tol:
-                rank_used = r
+                print(f'CUR rank {r}: rel err {err_cache[r]:.3e}')
+        return err_cache[r]
+
+    def first_at_most(hi: int, lo: int) -> int:
+        """Smallest rank in (lo, hi] with error < tol. Assumes err(hi) < tol."""
+        left, right, best = lo + 1, hi, hi
+        while left <= right:
+            mid = (left + right) // 2
+            if err_at(mid) < tol:
+                best = mid
+                right = mid - 1
+            else:
+                left = mid + 1
+        return best
+
+    rank_used = max_rank
+    err = err_at(min_rank)
+    if err < tol:
+        rank_used = min_rank
+    else:
+        prev, r = min_rank, min_rank
+        while r < max_rank:
+            prev = r
+            r = min(r + check_every, max_rank)
+            if err_at(r) < tol:
+                rank_used = first_at_most(r, prev)
                 break
+        else:
+            rank_used = max_rank
+            if verbose:
+                print(f'CUR rank {rank_used}: tol={tol:g} not reached '
+                      f'(rel err {err_at(rank_used):.3e})')
 
-            resids.append(resid)
-            errs.append(err)
-    
-    # errs = torch.tensor(errs)
-    # resids = torch.tensor(resids)
-    # ns = torch.arange(min_rank, min_rank + len(errs) * check_every, check_every)
-    # import matplotlib.pyplot as plt
-    # plt.plot(ns, errs[:len(ns)].cpu())
-    # plt.figure()
-    # plt.plot(ns, resids[:len(ns)].cpu())
-    # plt.show()
-    # quit()
-
-    # Final factors at the chosen rank
-    phi_clusts = phi_clusts_all[:rank_used]
-    alpha_clusts = alpha_clusts_all[:rank_used]
-    R_raw = torch.exp(-2j * torch.pi * (alpha_clusts @ phis_full))
-    C = torch.exp(-2j * torch.pi * (phi_clusts @ alphas_full))
-    R = V @ R_raw
+    phi_idxs, alpha_idxs = pivots_at(rank_used)
+    R, C = _cur_factors_from_pivots(phis_full, alphas_full, phi_idxs, alpha_idxs)
+    R = einsum(R, spat, 'Kp N, N -> Kp N')
+    C = einsum(C, temp, 'Kp M, M -> Kp M')
     if verbose:
-        print(f'adaptive CUR: rank={rank_used} (max_rank={max_rank})')
+        print(f'adaptive CUR: rank={rank_used}  rel err={err_at(rank_used):.3e}  '
+              f'(tol={tol:g}, max_rank={max_rank})')
     return R, C, rank_used
 
 

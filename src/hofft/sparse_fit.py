@@ -26,6 +26,11 @@ single batched least-squares solve.
 needed -- the sparse support is again the S nearest betas, and the
 coefficients are set directly from normalized alpha-space distances to those
 betas (considerably cheaper to compute than the least-squares solve).
+
+And the dual (Strategy 1 in math_docs/sparse_fit.md):
+
+``lstsq_compressed_kernels``: given fixed sparse (inds, coeffs) defining C,
+solve for the optimal compressed kernels H_comp.
 """
 
 import torch
@@ -40,10 +45,12 @@ from mr_recon.dtypes import complex_dtype
 
 from .decomp import hofft_params, lstsq_temporal
 from .matvec import subsample_idx
+from .linalg import lin_solve
 
 __all__ = [
     'sparse_params',
     'lstsq_compressed_fixed_support',
+    'lstsq_compressed_kernels',
     'smooth_sparse_coeffs',
     'sweep_smooth_interp_hyperparams',
     'batch_lstsq_fixed_support',
@@ -78,14 +85,15 @@ class sparse_params:
     num_validation : Optional[int]
         If given, autotunes the smooth sparse interpolation kernel parameters with num_validation held-out trajectory points.
     """
-    Q: int = 500
-    S: int = 5
     spatial_subsample: Optional[int] = None
     temporal_batch_size: Optional[int] = 2**15
     spatial_batch_size: Optional[int] = None
     interp_type: str = 'lstsq'
     lamda: float = 1e-6
-    num_validation: Optional[int] = None
+    num_validation: int = 50
+    d_grid: torch.Tensor = torch.logspace(-1, 0.7, 10)
+    p_grid: torch.Tensor = torch.linspace(0.1, 8.0, 8)
+    eps: float = 1e-3
 
 
 def _flatten_spatial(phis: torch.Tensor,
@@ -152,17 +160,35 @@ def _flatten_spatial(phis: torch.Tensor,
 
 def _nearest_beta_support(alphas: torch.Tensor,
                           betas: torch.Tensor,
-                          sparsity: int,
-                          trj_size: tuple) -> torch.Tensor:
-    """S-nearest betas in alpha space; returns sparse_inds with shape (S, *trj_size)."""
+                          sparsity: int) -> torch.Tensor:
+    """
+    S-nearest betas in alpha space; returns sparse_inds with shape (S, *trj_size).
+    
+    Args
+    ----
+    alphas : torch.Tensor
+        temporal phase coefficients with shape (B, *trj_size)
+    betas : torch.Tensor
+        representative alpha vectors with shape (B, Q)
+    sparsity : int
+        number of nonzero atoms (S) per column of C
+    trj_size : tuple
+        shape of the trajectory dimension
+        
+    Returns
+    -------
+    support : torch.Tensor
+        sparse indices (long) with shape (S, *trj_size), values in [0, Q)
+    """
     B = alphas.shape[0]
+    trj_size = alphas.shape[1:]
     T = int(np.prod(trj_size))
-    Q = betas.shape[0]
+    Q = betas.shape[1]
     S = min(sparsity, Q)
     alphas_flt = alphas.reshape((B, T)).T  # (T, B)
-    dists = torch.cdist(alphas_flt, betas)  # (T, Q)
+    dists = torch.cdist(alphas_flt, betas.T)  # (T, Q)
     support = torch.topk(dists, S, dim=-1, largest=False).indices  # (T, S)
-    return support.T.reshape((S, *trj_size))
+    return support.reshape((*trj_size, S))
 
 def smooth_sparse_coeffs(alphas: torch.Tensor,
                          betas: torch.Tensor,
@@ -191,7 +217,7 @@ def smooth_sparse_coeffs(alphas: torch.Tensor,
     alphas : torch.Tensor
         temporal phase coefficients with shape (B, *trj_size)
     betas : torch.Tensor
-        representative alpha vectors (e.g. from K_alphas_init) with shape (Q, B)
+        representative alpha vectors (e.g. from K_alphas_init) with shape (B, Q)
     sparsity : int
         number of nonzero atoms (S) per column of C
     kernel : str
@@ -217,7 +243,7 @@ def smooth_sparse_coeffs(alphas: torch.Tensor,
     B = alphas.shape[0]
     trj_size = alphas.shape[1:]
     T = int(np.prod(trj_size))
-    Q = betas.shape[0]
+    Q = betas.shape[1]
     S = min(sparsity, Q)
     tbs = T if temporal_batch_size is None else temporal_batch_size
     
@@ -227,7 +253,7 @@ def smooth_sparse_coeffs(alphas: torch.Tensor,
     idx_topk = torch.empty((T, S), dtype=torch.long, device=alphas.device)
     for t1 in range(0, T, tbs):
         t2 = min(t1 + tbs, T)
-        dists_batch = torch.cdist(alphas_flt[t1:t2], betas)  # (T, Q)
+        dists_batch = torch.cdist(alphas_flt[t1:t2], betas.T)  # (T, Q)
         dists_topk_batch, idx_topk_batch = torch.topk(dists_batch, S, 
                                                       dim=-1, 
                                                       largest=False)  # (T, S), ascending
@@ -257,11 +283,7 @@ def sweep_smooth_interp_hyperparams(phis: torch.Tensor,
                                     kern_bases: torch.Tensor,
                                     sparsity: int,
                                     hparams: hofft_params,
-                                    kernel: str = 'rbf',
-                                    d_grid: torch.Tensor = torch.logspace(-1, 0.7, 10),
-                                    p_grid: torch.Tensor = torch.linspace(0.1, 8.0, 8),
-                                    eps: float = 1e-3,
-                                    num_val: int = 2**10,
+                                    sparams: sparse_params,
                                     spatial_mask: Optional[torch.Tensor] = None,
                                     verbose: bool = True) -> tuple[float, Optional[float], torch.Tensor]:
     """
@@ -334,8 +356,13 @@ def sweep_smooth_interp_hyperparams(phis: torch.Tensor,
     L = spatial_factors.shape[0]
     W = kern_bases.shape[0]
     Q = compressed_kernels.shape[-1]
-    torch_dev = phis.device
     S = min(sparsity, Q)
+    torch_dev = phis.device
+    kernel = sparams.interp_type
+    d_grid = sparams.d_grid
+    p_grid = sparams.p_grid
+    eps = sparams.eps
+    num_val = sparams.num_validation
 
     # Validation subset of trajectory points, held out from the sparse fit itself
     num_val = min(num_val, T)
@@ -371,6 +398,107 @@ def sweep_smooth_interp_hyperparams(phis: torch.Tensor,
         errors = errors[:, 0]
     return best_d, best_p, errors
 
+# TODO make more effiicient. Won't fit in 3D and too slow in 2D ... 
+def lstsq_compressed_kernels(phis: torch.Tensor,
+                             alphas: torch.Tensor,
+                             spatial_factors: torch.Tensor,
+                             kern_bases: torch.Tensor,
+                             sparse_inds: torch.Tensor,
+                             sparse_coeffs: torch.Tensor,
+                             hparams: hofft_params,
+                             num_kernels: int,
+                             spatial_mask: Optional[torch.Tensor] = None,
+                             spatial_subsample: Optional[int] = None,
+                             temporal_batch_size: Optional[int] = None,
+                             lamda: float = 1e-6,
+                             verbose: bool = True) -> torch.Tensor:
+    """
+    Strategy 1: fit H' given fixed sparse C in  Phi ~= E^T H' C
+    (E stacks spatial_factors x kern_bases over voxels; shape (L*K, N)).
+
+    Normal equations (with Tikhonov on H'):
+        Ge H' Gc + lamda H' = E.conj() @ Phi @ C^H
+    where Ge[a,b] = sum_r conj(E[a,r]) E[b,r], Gc = C C^H.
+    Phi C^H is applied via the phase-model adjoint:
+        adjoint(C) = C Phi^H  =>  Phi C^H = adjoint(C)^H.
+
+    Args
+    ----
+    phis, alphas : phase coefficients (B, *im_size), (B, *trj_size)
+    spatial_factors : (L, *im_size)
+    kern_bases : (K, *im_size), K = prod(kern_size)
+    sparse_inds, sparse_coeffs : (S, *trj_size) S-sparse factors of C
+    hparams : matvec_type/kwargs, kern_size, solver
+    num_kernels : Q (dictionary size)
+    spatial_mask : optional (*im_size) weights folded into E
+    spatial_subsample, temporal_batch_size : accepted for API compat (unused)
+    lamda : Tikhonov regularizer
+    verbose : print shapes
+
+    Returns
+    -------
+    compressed_kernels : (L, *kern_size, Q)
+    """
+    del spatial_subsample, temporal_batch_size  # API compat with pipelines
+    L = spatial_factors.shape[0]
+    K = kern_bases.shape[0]
+    Q = num_kernels
+    S = sparse_inds.shape[0]
+    trj_size = sparse_inds.shape[1:]
+    im_size = phis.shape[1:]
+    M = int(np.prod(trj_size))
+    N = int(np.prod(im_size))
+    kern_size = hparams.kern_size
+    torch_dev = phis.device
+    assert np.prod(kern_size) == K
+    assert sparse_inds.shape == sparse_coeffs.shape
+
+    if spatial_mask is None:
+        spatial_mask = torch.ones(phis.shape[1:], dtype=complex_dtype, device=torch_dev)
+
+    # Densify S-sparse C -> (Q, M). Required for the dictionary model
+    # Phi ~= E^T H C that the compressed linop applies.
+    idx = sparse_inds.reshape(S, M).long()
+    coef = sparse_coeffs.reshape(S, M).to(complex_dtype)
+    C = torch.zeros((Q, M), dtype=complex_dtype, device=torch_dev)
+    for s in range(S):
+        C.scatter_add_(0, idx[s][None, :], coef[s][None, :])
+
+    # Y = Phi C^H via phase-model adjoint: adjoint(C) = C Phi^H
+    pm = hparams.matvec_type(phis, alphas, **hparams.matvec_kwargs)
+    Y = pm.adjoint(C.reshape((Q, *trj_size))).reshape((Q, -1)).mH  # (N, Q)
+
+    # E (L*K, N): mask-weighted spatial x kernel bases (L-major)
+    E = einsum(spatial_factors * spatial_mask, kern_bases,
+               'L ..., K ... -> L K ...').reshape((L * K, -1))
+
+    # Normal eqs for min ||Phi - E^T H C||_F^2 + lamda ||H||_F^2:
+    #   Ge H Gc + lamda H = RHS,  Ge[a,b] = sum_r conj(E[a,r]) E[b,r]
+    # (Note: Ge is E.conj()@E.T, NOT E@E.mH — they differ for complex E.)
+    Ge = einsum(E.conj(), E, 'a n, b n -> a b')   # (LK, LK)
+    Gc = C @ C.mH                                   # (Q, Q)
+    RHS = E.conj() @ Y                              # (LK, Q)
+    if verbose:
+        print(f'lstsq_compressed_kernels: Q={Q}, S={S}, LK={L*K}, N={E.shape[1]}')
+
+    # Solve via eigendecomp of Gc: Ge Z diag(d) + lamda Z = RHS U, H = Z U^H
+    evals, U = torch.linalg.eigh(Gc)
+    B = RHS @ U
+    Z = torch.zeros_like(B)
+    eye = torch.eye(L * K, dtype=complex_dtype, device=torch_dev)
+    d_max = evals.real.amax().clamp(min=1e-12)
+    for j in range(Q):
+        d = float(evals[j].real.clamp(min=0.0))
+        if d / d_max < 1e-8 and lamda == 0.0:
+            continue
+        A_j = d * Ge
+        if lamda != 0.0:
+            A_j = A_j + lamda * eye
+        Z[:, j] = lin_solve(A_j, B[:, j:j + 1], lamda=0.0, solver=hparams.solver)[:, 0]
+    H = Z @ U.mH
+    return H.reshape((L, *kern_size, Q))
+
+
 def batch_lstsq_fixed_support(corr0: torch.Tensor,
                               gram: torch.Tensor,
                               support: torch.Tensor,
@@ -403,18 +531,18 @@ def batch_lstsq_fixed_support(corr0: torch.Tensor,
     return support, coeffs
 
 def lstsq_compressed_fixed_support(phis: torch.Tensor,
-                                 alphas: torch.Tensor,
-                                 spatial_factors: torch.Tensor,
-                                 compressed_kernels: torch.Tensor,
-                                 kern_bases: torch.Tensor,
-                                 betas: torch.Tensor,
-                                 sparsity: int,
-                                 hparams: hofft_params,
-                                 spatial_mask: Optional[torch.Tensor] = None,
-                                 spatial_subsample: Optional[int] = None,
-                                 temporal_batch_size: Optional[int] = None,
-                                 lamda: float = 1e-6,
-                                 verbose: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+                                   alphas: torch.Tensor,
+                                   spatial_factors: torch.Tensor,
+                                   compressed_kernels: torch.Tensor,
+                                   kern_bases: torch.Tensor,
+                                   betas: torch.Tensor,
+                                   sparsity: int,
+                                   hparams: hofft_params,
+                                   spatial_mask: Optional[torch.Tensor] = None,
+                                   spatial_subsample: Optional[int] = None,
+                                   temporal_batch_size: Optional[int] = None,
+                                   lamda: float = 1e-6,
+                                   verbose: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Finds least squares optimal interpolation coefficients for the sparse HOFFT kernels.
     
@@ -475,8 +603,7 @@ def lstsq_compressed_fixed_support(phis: torch.Tensor,
         pm = hparams.matvec_type(phis_flt, alphas_flt, **hparams.matvec_kwargs)
         corr = pm.forward(Dw)  # (Q, T)
         corr_t = corr.T.contiguous()  # (T, Q)
-        support = _nearest_beta_support(alphas, betas, S, trj_size)
-        support_flt = support.reshape((S, T)).T.contiguous()  # (T, S)
+        support_flt = _nearest_beta_support(alphas_flt, betas, S).contiguous()  # (T, S)
     else:
         corr_t = None
         support_flt = None
@@ -490,7 +617,7 @@ def lstsq_compressed_fixed_support(phis: torch.Tensor,
         if save_mem:
             pm = hparams.matvec_type(phis_flt, alphas_flt[:, t1:t2], **hparams.matvec_kwargs)
             corr_batch = pm.forward(Dw).T
-            support_batch = _nearest_beta_support(alphas_flt[:, t1:t2], betas, S, (t2-t1,)).T
+            support_batch = _nearest_beta_support(alphas_flt[:, t1:t2], betas, S)
         else:
             corr_batch = corr_t[t1:t2]
             support_batch = support_flt[t1:t2]

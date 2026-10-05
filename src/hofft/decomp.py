@@ -6,36 +6,42 @@ from dataclasses import dataclass, field
 from einops import rearrange, einsum
 from typing import Optional, Union
 from einops import einsum
-from math import floor, ceil
 
-from .utils import gen_grd, lin_solve
+from .utils import gen_grd
 from .matvec import matvec, matvec_naive
-from .phase_coeffs import rescale_phis_alphas
+from .linalg import svd_operator, lin_solve
 
 __all__ = [
     'hofft_params',
     'build_kern_bases',
-    'funcs_to_phase',
     'als_iterations',
-    'als_anderson_iterations',
     'lstsq_spatial',
     'lstsq_temporal',
 ]
 
 @dataclass
 class hofft_params: 
+    # Model params
     kern_size: tuple
     os: float
     L: int
-    reduced_im_size: Optional[tuple] = None
+    # Other
     matvec_type: matvec = matvec_naive
     matvec_kwargs: dict = field(default_factory=dict)
     spatial_init: Union[torch.Tensor, str] = 'seg'
     spatial_batch_size: Optional[int] = None
-    anderson_order: Optional[int] = None
+    normalize_coeffs: bool = True
+    cur_rank: Optional[int] = None
+    # Reduction
     kalpha_method: str = 'maxmin'
-    solver: str = 'pinv'
+    reduced_im_size: Optional[tuple] = None
+    time_reduction_factor: Optional[float] = None
+    num_compressed_bases: Optional[int] = None
+    num_representative_alphas: Optional[int] = None
+    # Solver
+    max_als_iter: int = 100
     lamda: float = 0.0
+    solver: str = 'pinv'
     verbose: bool = True
     """
     Parameters for HOFFT models.
@@ -59,6 +65,10 @@ class hofft_params:
         'matvec_histogram' - Histogram-based matrix-vector product
     matvec_kwargs : dict
         Keyword arguments for initalizing the matrix vector product (batch sizes, interpolation order, etc.)
+    cur_rank : Optional[int]
+        Pipeline matvec switch. None uses matvec_naive on (V^T, S U^T).
+        Negative uses adaptive-rank CUR; positive uses fixed-rank CUR
+        with that rank. Both CUR paths take the whitened (V^T, U^T, S).
     spatial_init : Union[torch.Tensor, str]
         If string:
         'ones' - uses ones to initialize spatial factors
@@ -106,50 +116,89 @@ def build_kern_bases(kern_size: tuple,
     kern_bases = torch.exp(-2j * np.pi * phz)
     return kern_bases
 
-def funcs_to_phase(kern_weights: torch.Tensor,
-                   spatial_factors: torch.Tensor,
-                   os: Optional[float] = 1.0) -> torch.Tensor:
+def svd_decomp(phase_model: matvec,
+               hparams: hofft_params,
+               mask: Optional[torch.Tensor] = None,
+               svd_method: str = 'lobpcg',
+               max_iter: int = 100,
+               tol: float = 1e-2,
+               verbose: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Convert kernel weights and spatial factors to phase maps
+    Performs an SVD to decompose the phase model into spatial and temporal factors.
     
     Args
     ----
-    kern_weights : torch.Tensor
-        Kernel weights with shape (L, *kern_size, *trj_size)
-    spatial_factors : torch.Tensor
-        Spatial factors with shape (L, *im_size)
-    os : Optional[float]
-        Oversampling factor.
+    phase_model : matvec
+        phase model to decompose
+    hparams : hofft_params
+        HOFFT parameters
+    mask : torch.Tensor, optional
+        image weighting mask with shape im_size
+    svd_method : str, optional
+        method to use for SVD. Options are:
+        'lobpcg' - use LOBPCG to solve for the SVD
+        'power' - use power method to solve for the SVD
+    max_iter : int, optional
+        maximum number of iterations
+    tol : float, optional
+        tolerance for SVD convergence
+    verbose : bool, optional
+        whether to print progress
         
     Returns
     -------
-    phz : torch.Tensor
-        Phase maps with shape (*trj_size, *im_size)
+    spatial_factors : torch.Tensor
+        spatial factors with shape (L, *im_size)
+    temporal_factors : torch.Tensor
+        temporal factors with shape (L, *trj_size)
     """
     # Consts
-    kern_size = kern_weights.shape[1:-1]
-    im_size = spatial_factors.shape[1:]
-    torch_dev = kern_weights.device
-    d = len(im_size)
-    trj_size = kern_weights.shape[(d+1):]
-    L = kern_weights.shape[0]
-    K = np.prod(kern_size)
-    T = np.prod(trj_size)
+    im_size = phase_model.im_size
+    trj_size = phase_model.trj_size
+    M = int(np.prod(trj_size))
+    N = int(np.prod(im_size))
     
-    # Flatten
-    kern_weights_flt = kern_weights.reshape((L, K, T))
+    if svd_method == 'lobpcg':
+        use_lobpcg = True
+    elif svd_method == 'power':
+        use_lobpcg = False
+    else:
+        raise ValueError(f'Invalid SVD method: {svd_method}')
     
-    # Make kernel bases
-    rs = gen_grd(im_size).to(torch_dev)
-    kern = gen_grd(kern_size, kern_size).to(torch_dev).reshape((-1, d)) / os
-    phz = einsum(kern, rs, 'K D, ... D -> K ...')
-    kern_bases = torch.exp(-2j * np.pi * phz)
+    # Perform SVD on a tall matrix
+    if N < M:
+        A = lambda x: phase_model.forward(x * mask)
+        AHA = lambda x: phase_model.adjoint(phase_model.forward(x * mask)) * mask.conj()
+        inp_example = torch.zeros(phase_model.im_size, 
+                                dtype=torch.complex64, 
+                                device=phase_model.phis.device)
+        U, S, Vh = svd_operator(A, AHA, inp_example, 
+                                rank=hparams.L,
+                                num_iter=max_iter,
+                                lobpcg=use_lobpcg,
+                                tol=tol,
+                                verbose=verbose)
+        U = U.moveaxis(-1, 0)
+    # Perform SVD on a wide matrix, use A.H instead of A
+    else:    
+        AH = lambda y: phase_model.adjoint(y) * mask.conj()
+        AAH = lambda y: phase_model.forward(phase_model.adjoint(y) * mask.abs().square())
+        inp_example = torch.zeros(phase_model.trj_size, 
+                                dtype=torch.complex64, 
+                                device=phase_model.alphas.device)
+        Vh, S, U = svd_operator(AH, AAH, inp_example, 
+                                rank=hparams.L,
+                                num_iter=max_iter,
+                                lobpcg=use_lobpcg,
+                                tol=tol,
+                                verbose=verbose)
+        Vh = Vh.moveaxis(-1, 0).conj()
+        U = U.conj()
     
-    # Apply
-    phz = einsum(kern_weights_flt, kern_bases, 'L K T, K ... -> L T ...')
-    phz = einsum(phz, spatial_factors, 'L T ..., L ... -> T ...')
+    temporal_factors = einsum(U, S ** 0.5, 'L ..., L -> L ...')
+    spatial_factors = einsum(Vh, S ** 0.5, 'L ..., L -> L ...')
     
-    return phz.reshape((*trj_size, *im_size))
+    return spatial_factors, temporal_factors
 
 def als_iterations(phase_model: matvec, 
                    kern_bases: torch.Tensor,
@@ -218,7 +267,7 @@ def als_iterations(phase_model: matvec,
     
     # Pick random space and time indices for error computation
     mask_flt = mask.flatten()
-    idxs_nonz = torch.argwhere(mask_flt > 0)[:, 0]
+    idxs_nonz = torch.argwhere(mask_flt.abs() > 0)[:, 0]
     idxs_space = idxs_nonz[torch.randperm(len(idxs_nonz))[:n_err_pts].to(kern_bases.device)]
     idxs_time = torch.randperm(M)[:n_err_pts].to(kern_bases.device)
     kern_bases_flt = kern_bases.reshape((K, -1))[:,idxs_space]
@@ -275,199 +324,6 @@ def als_iterations(phase_model: matvec,
         # Update previous values
         kernel_weights_prev = kernel_weights
         spatial_factors_prev = spatial_factors
-        
-    return spatial_factors, kernel_weights
-
-def als_iterations_tempinit(phase_model: matvec, 
-                            kern_bases: torch.Tensor,
-                            kernel_weights_init: torch.Tensor,
-                            mask: Optional[torch.Tensor] = None,
-                            max_iter: Optional[int] = 100,
-                            verbose: Optional[bool] = False) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Perform ALS iterations to solve for spatial factors and kernel weights.
-    
-    Args
-    ----
-    phase_model : mr_recon.linop
-        high order phase matrix-vector operation
-    kern_bases : torch.Tensor
-        kernel bases with shape (K, *im_size)
-    kernel_weights_init : torch.Tensor
-        initial kernel weights with shape (L, K, *trj_size)
-    mask : torch.Tensor, optional
-        image weighting mask with shape im_size
-    max_iter : int, optional
-        maximum number of iterations
-    verbose : bool, optional
-        whether to print progress
-    
-    Returns
-    -------
-    spatial_factors : torch.Tensor
-        spatial factors with shape (L, *im_size)
-    kernel_weights : torch.Tensor
-        kernel weights with shape (L, K, *trj_size)
-    """
-        
-    # Default mask
-    if mask is None:
-        mask = torch.ones_like(kern_bases[0])
-        
-    # Weights only 
-    if max_iter == 0:
-        spatial_factors = lstsq_spatial(phase_model, kern_bases, kernel_weights_init, mask=mask)
-        return spatial_factors, kernel_weights_init
-    
-    # Stopping criteria
-    kwargs_allclose = {'atol': 0.0, 'rtol': 1e-3}
-    
-    # Momentum term
-    momentum = lambda k : 0.0
-    k0 = 0
-    
-    # Least squares parameters
-    lamda = 1e0 * 0
-    # solver = 'solve'
-    solver = 'pinv'
-    
-    # ALS till max_iter
-    spatial_factors_prev = None
-    kernel_weights_prev = kernel_weights_init
-    tbar = tqdm(range(max_iter), 'ALS iterations', disable=not verbose)
-    for k in tbar:
-        
-        # ALS spatial updates
-        spatial_factors = lstsq_spatial(phase_model, kern_bases, kernel_weights_prev, 
-                                        mask=mask,
-                                        lamda=lamda,
-                                        spatial_factors_prev=spatial_factors_prev,
-                                        solver=solver)
-        spatial_factors = spatial_factors.nan_to_num(0.0)
-        if k > k0:
-            spatial_factors = spatial_factors + beta * (spatial_factors_prev - spatial_factors)
-        
-        # ALS temporal updates
-        kernel_weights = lstsq_temporal(phase_model, kern_bases, spatial_factors, 
-                                        mask=mask,
-                                        lamda=lamda,
-                                        kernel_weights_prev=kernel_weights_prev,
-                                        solver=solver)
-        if k > k0:
-            beta = momentum(k)
-            kernel_weights = kernel_weights + beta * (kernel_weights_prev - kernel_weights)
-        kernel_weights = kernel_weights.nan_to_num(0.0)
-        
-        # Update previous values
-        kernel_weights_prev = kernel_weights
-        spatial_factors_prev = spatial_factors
-        
-    return spatial_factors, kernel_weights
-  
-def als_anderson_iterations(phase_model: matvec, 
-                            kern_bases: torch.Tensor,
-                            spatial_factors_init: torch.Tensor,
-                            anderson_order: int = 3,
-                            mask: Optional[torch.Tensor] = None,
-                            max_iter: Optional[int] = 100,
-                            verbose: Optional[bool] = False) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Perform ALS iterations to solve for spatial factors and kernel weights.
-    
-    Args
-    ----
-    phase_model : mr_recon.linop
-        high order phase matrix-vector operation
-    kern_bases : torch.Tensor
-        kernel bases with shape (K, *im_size)
-    spatial_factors_init : torch.Tensor
-        initial spatial factors with shape (L, *im_size)
-    anderson_order : int
-        order of the Anderson acceleration
-    mask : torch.Tensor, optional
-        image weighting mask with shape im_size
-    max_iter : int, optional
-        maximum number of iterations
-    verbose : bool, optional
-        whether to print progress
-    
-    Returns
-    -------
-    spatial_factors : torch.Tensor
-        spatial factors with shape (L, *im_size)
-    kernel_weights : torch.Tensor
-        kernel weights with shape (L, K, *trj_size)
-    """
-        
-    # Default mask
-    if mask is None:
-        mask = torch.ones_like(spatial_factors_init[0])
-        
-    # First iteration
-    kernel_weights = lstsq_temporal(phase_model, kern_bases, spatial_factors_init, mask=mask)
-    kernel_weights = kernel_weights.nan_to_num(0.0)
-    if max_iter == 0:
-        return kernel_weights, spatial_factors_init
-    spatial_factors = lstsq_spatial(phase_model, kern_bases, kernel_weights, mask=mask)
-    spatial_factors = spatial_factors.nan_to_num(0.0)
-    
-    # Initialize Anderson acceleration
-    xs = torch.zeros((anderson_order, kernel_weights.numel() + spatial_factors.numel()), 
-                     dtype=kernel_weights.dtype, device=kernel_weights.device)
-    xs[-1] = torch.cat((kernel_weights.flatten(), spatial_factors.flatten()))
-    fs = torch.zeros_like(xs)
-    
-    # Stopping criteria
-    kwargs_allclose = {'atol': 0.0, 'rtol': 1e-3}
-    
-    # Iteration in convenient form
-    def f(x):
-        kws = x[:kernel_weights.numel()].reshape(kernel_weights.shape)
-        sfs = x[kernel_weights.numel():].reshape(spatial_factors.shape)
-        
-        kws_next = lstsq_temporal(phase_model, kern_bases, sfs, mask=mask)
-        kws_next = kws_next.nan_to_num(0.0)
-        sfs_next = lstsq_spatial(phase_model, kern_bases, kws_next, mask=mask)
-        sfs_next = sfs_next.nan_to_num(0.0)
-        
-        fx = torch.cat((kws_next.flatten(), sfs_next.flatten()))
-        return fx
-    
-    # ALS till max_iter
-    tbar = tqdm(range(max_iter), 'Anderson ALS Iterations', disable=not verbose)
-    for k in tbar:
-        
-        order = min(k+1, anderson_order)
-        
-        # Compute f(x_k)
-        fk = f(xs[-1])
-        fs[:-1] = fs[1:].clone()
-        fs[-1] = fk
-        
-        # Solve for x_{k+1} via anderson minimization
-        G = (fs - xs)[-order:].T # (M+N) x (anderson_order)
-        # G = torch.vstack((G.real, G.imag))
-        A = torch.zeros((order+1, order+1), dtype=torch.float32, device=G.device)
-        A[:-1, :-1] = (G.H @ G).real
-        A[:-1, -1] = 1.0
-        A[-1, :-1] = 1.0
-        b = torch.zeros((order+1), dtype=torch.float32, device=G.device)
-        b[-1] = 1.0
-        coeffs = torch.linalg.solve(A, b)[:-1]
-        xk1 = fs[-order:].T @ coeffs.type(torch.complex64)
-        
-        # Update xs
-        xs[:-1] = xs[1:].clone()
-        xs[-1] = xk1
-        
-        # TODO REMOVEME
-        # Check convergence
-        if k > 0 and k % 10 == 0:
-            if torch.allclose(xs[-2], xs[-1], **kwargs_allclose):
-                break
-            
-    kernel_weights = xs[-1][:kernel_weights.numel()].reshape(kernel_weights.shape)
-    spatial_factors = xs[-1][kernel_weights.numel():].reshape(spatial_factors.shape)
         
     return spatial_factors, kernel_weights
 

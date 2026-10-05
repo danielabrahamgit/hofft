@@ -7,6 +7,8 @@ import itertools
 import torch
 import torch.nn.functional as F
 from typing import Optional
+from flash_kmeans import batch_kmeans_Euclid
+from fast_pytorch_kmeans import KMeans
 
 __all__ = [
     'resize',
@@ -16,6 +18,8 @@ __all__ = [
     'spatial_resize_poly',
     'reduce_spatial',
     'expand_spatial',
+    'reduce_temporal',
+    'expand_temporal',
 ]
 
 # ---------------- General ----------------
@@ -154,51 +158,6 @@ def normalize(shifted, target, ofs=False, mag=True):
 
     out = a * shifted + b
     return out
-
-def lin_solve(AHA: torch.Tensor, 
-              AHb: torch.Tensor, 
-              lamda: Optional[float] = 0.0, 
-              solver: Optional[int] = 'solve') -> torch.Tensor:
-    """
-    Solves (AHA + lamda I) @ x = AHb for x
-
-    Args
-    ----
-    AHA : torch.Tensor
-        square matrix with shape (..., n, n)
-    AHb : torch.Tensor
-        matrix with shape (..., n, m)
-    lamda : float
-        optional L2 regularization 
-    solver : str
-        'pinv' - pseudo inverse 
-        'solve' - torch.linalg.solve
-        'lstsq' - least squares
-        'inv' - regular inverse
-    
-    Returns
-    -------
-    x : torch.Tensor
-        solution with shape (..., n, m)
-    """
-    solver = solver.lower()
-    if lamda > 0:
-        I = torch.eye(AHA.shape[-1], dtype=AHA.dtype, device=AHA.device)
-        tup = (AHA.ndim - 2) * (None,) + (slice(None),) * 2
-        AHA += lamda * I[tup]
-    if solver == 'lstsq':
-        x = torch.linalg.lstsq(AHA, AHb).solution
-    elif solver == 'solve':
-        x = torch.linalg.solve(AHA, AHb)
-    elif solver == 'pinv':
-        x = torch.linalg.pinv(AHA, hermitian=True) @ AHb
-    elif solver == 'pinv_noherm':
-        x = torch.linalg.pinv(AHA) @ AHb
-    elif solver == 'inv':
-        x = torch.linalg.inv(AHA) @ AHb
-    else:
-        raise NotImplementedError
-    return x
 
 # ---------------- Interpolation ----------------
 def _cubic_kernel(t: torch.Tensor, a: float = -0.75) -> torch.Tensor:
@@ -413,10 +372,19 @@ def spatial_interp(spatial_input: torch.Tensor,
     crds_flt = coords.reshape((-1, K))
 
     can_grid_sample = K in (1, 2, 3) and not (K == 3 and order == 3)
-    if can_grid_sample:
-        out = _interp_grid_sample(spatial_input, crds_flt, order)
+    interp = _interp_grid_sample if can_grid_sample else _interp_general_nd
+    # 3D cubic especially: _interp_general_nd stores (M, 4) idx/weight per
+    # axis. Chunk so a 320^3 upsample does not allocate multi-GB temporaries.
+    max_m = 1 << 20
+    Mtot = crds_flt.shape[0]
+    if Mtot <= max_m:
+        out = interp(spatial_input, crds_flt, order)
     else:
-        out = _interp_general_nd(spatial_input, crds_flt, order)
+        pieces = []
+        for m1 in range(0, Mtot, max_m):
+            m2 = min(m1 + max_m, Mtot)
+            pieces.append(interp(spatial_input, crds_flt[m1:m2], order))
+        out = torch.cat(pieces, dim=1)
 
     out = out.reshape((N, *coords.shape[:-1]))  # Reshape to (N, *crds_size)
     return out
@@ -454,14 +422,32 @@ def spatial_resize_poly(x: torch.Tensor,
         x = x.reshape((-1, *x.shape[-len(im_size):]))
         squeeze = False
 
-    # Call spatial interpolation
     inp_size = x.shape[-len(im_size):]
     kwargs = {'order': order, 'mode': mode}
-    inp_size_tensor = torch.tensor(inp_size).to(x.device)
-    spatial_crds = (gen_grd(im_size, balanced=True).to(x.device) + 0.5) * (inp_size_tensor - 1)
-    x_rs = spatial_interp(x, spatial_crds, **kwargs).reshape(oshape)
+    K = len(im_size)
+    N = x.shape[0]
+    torch_dev = x.device
+    M = 1
+    for n in im_size:
+        M *= int(n)
 
-    # Reshape to original batch dims
+    # Same mapping as (gen_grd(im_size, balanced=True) + 0.5) * (inp_size - 1),
+    # but as 1D axes so we never meshgrid the full output FOV.
+    axis_crds = [
+        torch.linspace(0, inp_size[i] - 1, im_size[i], device=torch_dev, dtype=torch.float32)
+        for i in range(K)
+    ]
+
+    max_m = 1 << 20
+    x_rs_flt = torch.empty((N, M), dtype=x.dtype, device=torch_dev)
+    for m1 in range(0, M, max_m):
+        m2 = min(m1 + max_m, M)
+        lin = torch.arange(m1, m2, device=torch_dev)
+        ijk = torch.unravel_index(lin, im_size)
+        spatial_crds = torch.stack([axis_crds[d][ijk[d]] for d in range(K)], dim=-1)
+        x_rs_flt[:, m1:m2] = spatial_interp(x, spatial_crds, **kwargs)
+    x_rs = x_rs_flt.reshape(oshape)
+
     if squeeze:
         return x_rs[0]
     else:
@@ -518,3 +504,297 @@ def expand_spatial(spatial_data: torch.Tensor,
                                im_size=im_size_high,
                                order=order,
                                mode='nearest')
+
+def reduce_temporal(temporal_data: torch.Tensor,
+                    num_time_low: int,
+                    dim: int = -1,
+                    order: int = 3) -> torch.Tensor:
+    """
+    Downsample the last (temporal) dimension by ``ds_factor`` using the same
+    align-corners polynomial resize as :func:`reduce_spatial`. Endpoints are
+    preserved, so ``expand_temporal(reduce_temporal(x), ...)`` approximately
+    recovers smooth signals.
+
+    Args
+    ----
+    temporal_data : torch.Tensor
+        Temporal data to reduce with arb shape
+    num_time_low : int
+        Number of time points to reduce to
+    order : int, optional
+        Order of the polynomial interpolation (0, 1, or 3)
+        
+    Returns
+    -------
+    temporal_data_low : torch.Tensor
+        Reduced temporal data 
+    """
+    temporal_data_low = temporal_data.moveaxis(dim, -1)
+    temporal_data_low = spatial_resize_poly(temporal_data_low, im_size=(num_time_low,), order=order)
+    temporal_data_low = temporal_data_low.moveaxis(-1, dim)
+    return temporal_data_low
+
+def expand_temporal(temporal_data: torch.Tensor,
+                    num_time_high: int,
+                    dim: int = -1,
+                    order: int = 3) -> torch.Tensor:
+    """
+    Upsample the last (temporal) dimension by ``num_time_high`` using the same
+    align-corners polynomial resize as :func:`expand_spatial`.
+
+    Args
+    ----
+    temporal_data : torch.Tensor
+        Temporal data to expand with arb shape
+    num_time_high : int
+        Integer upsampling factor
+    order : int, optional
+        Order of the polynomial interpolation (0, 1, or 3)
+
+    Returns
+    -------
+    temporal_data_high : torch.Tensor
+        Expanded temporal data
+    """
+    temporal_data_high = temporal_data.moveaxis(dim, -1)
+    temporal_data_high = spatial_resize_poly(temporal_data_high, im_size=(num_time_high,), order=order)
+    temporal_data_high = temporal_data_high.moveaxis(-1, dim)
+    return temporal_data_high
+
+# ---------------- Quantization and Sampling ----------------
+def kmeans_centroids(data: torch.Tensor,
+                     K: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Find K centroids of the data using K-means clustering.
+    
+    Args
+    ----
+    data : torch.Tensor
+        Data to find the centroids of with shape (N, d)
+    K : int
+        Number of centroids to find
+
+    Returns
+    -------
+    centroids : torch.Tensor
+        Centroids with shape (K, d)
+    idxs : torch.Tensor
+        Indices of cluster membership for each data sample with shape (N,) in [0, K-1]
+    idx_nearest : torch.Tensor
+        Indices of the nearest data sample for each centroid with shape (K,) in [0, N-1]
+    """
+    # Consts
+    N, d = data.shape
+    
+    # ------------ Fast PyTorch KMeans ------------
+    kmeans = KMeans(n_clusters=K)
+    idxs = kmeans.fit_predict(data)
+    centroids = kmeans.centroids
+    
+    
+    # ------------ Flash KMeans ------------
+    # # Pad dimensions to power of 2 -- annoying triton requirement
+    # dpad = 1 << (d - 1).bit_length()   # 32 for D=23
+    # if dpad < 16:
+    #     dpad = 16
+    # data_padded = torch.zeros((N, dpad), dtype=data.dtype, device=data.device)
+    # data_padded[..., :d] = data
+    
+    # # Find centroids
+    # idxs, centroids, _ = batch_kmeans_Euclid(data_padded[None,], n_clusters=K)
+    # centroids = centroids[0, :, :d]
+    # idxs = idxs[0]
+    
+    # Find nearest data sample for each centroid
+    idx_nearest = torch.zeros(K, dtype=torch.long, device=data.device)
+    for k in range(K):
+        active_set = data[idxs == k]
+        if active_set.shape[0] > 0:
+            idx_nearest[k] = torch.argmin((centroids[k] - active_set).norm(dim=-1))
+        else:
+            idx_nearest[k] = torch.randint(0, N, (1,), device=data.device)
+    
+    # Return
+    return centroids, idxs, idx_nearest
+
+def maxmin_indices(vectors: torch.Tensor,
+                   K: int,
+                   seed: Optional[int] = None) -> torch.Tensor:
+    """
+    Greedy farthest-point (maxmin) index selection
+
+    Args
+    ----
+    data : torch.Tensor
+        Data to find the centroids indices of with shape (N, d)
+    K : int
+        Number of centroids to find
+    seed : int, optional
+        Random seed for the initial point
+
+    Returns
+    -------
+    idx_nearest : torch.Tensor
+        Indices of the data sample for each centroid with shape (K,) in [0, N-1]
+    """
+    # Consts
+    N = vectors.shape[0]
+    gen = torch.Generator(device=vectors.device)
+    if seed is not None:
+        gen.manual_seed(seed)
+        
+    # Keep indices on device: int(argmax)/int(randint) would sync every pivot.
+    picked = torch.empty(K, dtype=torch.long, device=vectors.device)
+    picked[0] = torch.randint(0, N, (), generator=gen, device=vectors.device)
+    dist = torch.linalg.norm(vectors - vectors[picked[0]], dim=-1)
+    for k in range(1, K):
+        nxt = dist.argmax()
+        picked[k] = nxt
+        dist = torch.minimum(dist, torch.linalg.norm(vectors - vectors[nxt], dim=-1))
+    return picked
+
+def maxmin_centroids(data: torch.Tensor,
+                     K: int,
+                     seed: Optional[int] = None) -> torch.Tensor:
+    """
+    Find K centroids of the data using the maxmin algorithm.
+    
+    Args
+    ----
+    data : torch.Tensor
+        Data to find the centroids of with shape (N, d)
+    K : int
+        Number of centroids to find 
+    seed : int, optional
+        Random seed for the initial point
+
+    Returns
+    -------
+    centroids : torch.Tensor
+        Centroids with shape (K, d)
+    idxs : torch.Tensor
+        Indices of cluster membership for each data sample with shape (N,) in [0, K-1]
+    idx_nearest : torch.Tensor
+        Indices of the nearest data sample for each centroid with shape (K,) in [0, N-1]
+    """
+    # Consts
+    N = data.shape[0]
+    
+    # Find indices of nearest data samples
+    idxs_nearest = maxmin_indices(data, K, seed)
+    centroids = data[idxs_nearest]
+    
+    # Assign nearest data sample to each centroid
+    idxs = torch.zeros(N, dtype=torch.long, device=data.device)
+    nbs = 2 ** 10
+    for n1 in range(0, N, nbs):
+        n2 = min(n1 + nbs, N)
+        idxs[n1:n2] = torch.argmin(torch.cdist(data[n1:n2], centroids), dim=-1)
+    
+    # Return
+    return centroids, idxs_nearest
+
+def fps_multi_center_indices(vectors: torch.Tensor,
+                             K: int,
+                             P: int = 1,
+                             seed: Optional[int] = None) -> torch.Tensor:
+    """
+    Greedy farthest-point selection for the multi-center covering objective
+
+        min_{centroids}  max_n  sum_{p=1}^P d_{n,p}
+
+    where d_{n,p} is the p-th smallest of {||v_n - centroid_k||}_{k=1}^K.
+    P = 1 reduces to standard maxmin / FPS: each new pick is the point whose
+    nearest selected center is farthest away.
+
+    Args
+    ----
+    vectors : torch.Tensor
+        Data with shape (N, d)
+    K : int
+        Number of centroids to find
+    P : int
+        Number of nearest centers that enter the per-point cost. Clamped to [1, K].
+    seed : int, optional
+        Random seed for the initial point
+
+    Returns
+    -------
+    idx_nearest : torch.Tensor
+        Indices of the selected samples, shape (K,) in [0, N-1]
+    """
+    # Consts
+    N = vectors.shape[0]
+    K = min(K, N)
+    P = max(1, min(P, K))
+    gen = torch.Generator(device=vectors.device)
+    if seed is not None:
+        gen.manual_seed(seed)
+
+    # dists_p[n, :p] = p smallest distances to the centers picked so far
+    # (unused slots are +inf and do not contribute to the score)
+    dists_p = torch.full((N, P), torch.inf, device=vectors.device, dtype=vectors.dtype)
+    picked_mask = torch.zeros(N, dtype=torch.bool, device=vectors.device)
+    picked = []
+
+    nxt = int(torch.randint(0, N, (1,), generator=gen, device=vectors.device))
+    for _ in range(K):
+        picked.append(nxt)
+        picked_mask[nxt] = True
+        d_new = torch.linalg.norm(vectors - vectors[nxt], dim=-1)
+        dists_p = torch.cat([dists_p, d_new[:, None]], dim=-1).sort(dim=-1).values[:, :P]
+
+        finite = torch.isfinite(dists_p)
+        score = torch.where(finite, dists_p, torch.zeros_like(dists_p)).sum(dim=-1)
+        score = score.masked_fill(picked_mask, torch.finfo(vectors.dtype).min)
+        nxt = int(score.argmax())
+
+    return torch.tensor(picked, dtype=torch.long, device=vectors.device)
+
+def fps_multi_center_centroids(data: torch.Tensor,
+                               K: int,
+                               P: int = 1,
+                               seed: Optional[int] = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Find K centroids by greedy FPS on the multi-center covering objective
+
+        min_{centroids}  max_n  sum_{p=1}^P d_{n,p}
+
+    where d_{n,p} is the p-th smallest of {||v_n - centroid_k||}_{k=1}^K.
+    P = 1 is exactly :func:`maxmin_centroids`.
+
+    Args
+    ----
+    data : torch.Tensor
+        Data to find the centroids of with shape (N, d)
+    K : int
+        Number of centroids to find
+    P : int
+        Number of nearest centers in the per-point cost
+    seed : int, optional
+        Random seed for the initial point
+
+    Returns
+    -------
+    centroids : torch.Tensor
+        Centroids with shape (K, d)
+    idxs : torch.Tensor
+        Indices of cluster membership for each data sample with shape (N,) in [0, K-1]
+    idx_nearest : torch.Tensor
+        Indices of the selected data samples, shape (K,) in [0, N-1]
+    """
+    # Consts
+    N = data.shape[0]
+
+    # Greedy multi-center FPS picks
+    idx_nearest = fps_multi_center_indices(data, K, P=P, seed=seed)
+    centroids = data[idx_nearest]
+
+    # Assign each sample to its nearest selected center
+    idxs = torch.zeros(N, dtype=torch.long, device=data.device)
+    nbs = 2 ** 10
+    for n1 in range(0, N, nbs):
+        n2 = min(n1 + nbs, N)
+        idxs[n1:n2] = torch.argmin(torch.cdist(data[n1:n2], centroids), dim=-1)
+
+    return centroids, idxs, idx_nearest

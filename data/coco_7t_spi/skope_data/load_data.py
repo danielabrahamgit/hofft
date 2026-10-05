@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from mr_sim.phantoms import shepp_logan
 from mr_recon.utils import gen_grd, cvplot
 from hofft.phase_coeffs import sph_bases, coco_bases, rescale_phis_alphas
-from einops import einsum
+from einops import einsum, rearrange
 
 def load_skope(data_folder: str, 
                scan_id: int | str, 
@@ -60,23 +60,48 @@ def load_skope(data_folder: str,
         data = torch.from_numpy(data).to(torch.float32)
     return data
 
-im_size = (50,)*3
+im_size = (320,)*3
 fov = 0.24 # meters
-mask = (shepp_logan().img(im_size).abs() > 0.0).float()
 
-data_coco = load_skope('/local_mount/space/mayday/data/users/abrahamd/hofft/data/coco_7t_spi/skope_data/raw', 3, 'kcoco')[:, 0::10]
-data_spha = load_skope('/local_mount/space/mayday/data/users/abrahamd/hofft/data/coco_7t_spi/skope_data/raw', 3, 'kspha')[4:, 0::10]
+# Each file is 18 groups x 250 TRs, stored as (G, T, R) with R fastest.
+# Part 1 (scan 6) is even TRs; part 2 (scan 8) is odd TRs.
+data_coco_even = load_skope('/local_mount/space/mayday/data/users/abrahamd/hofft/data/coco_7t_spi/skope_data/raw', 6, 'kcoco')
+data_spha_even = load_skope('/local_mount/space/mayday/data/users/abrahamd/hofft/data/coco_7t_spi/skope_data/raw', 6, 'kspha')
+data_coco_odd = load_skope('/local_mount/space/mayday/data/users/abrahamd/hofft/data/coco_7t_spi/skope_data/raw', 8, 'kcoco')
+data_spha_odd = load_skope('/local_mount/space/mayday/data/users/abrahamd/hofft/data/coco_7t_spi/skope_data/raw', 8, 'kspha')
+data_coco_even = rearrange(data_coco_even, 'B (G T R) -> B R G T', R=23_000, T=250)
+data_spha_even = rearrange(data_spha_even, 'B (G T R) -> B R G T', R=23_000, T=250)
+data_coco_odd = rearrange(data_coco_odd, 'B (G T R) -> B R G T', R=23_000, T=250)
+data_spha_odd = rearrange(data_spha_odd, 'B (G T R) -> B R G T', R=23_000, T=250)
+
+# Interleave TRs: even from part1 (scan 6), odd from part2 (scan 8)
+data_coco = torch.zeros((data_coco_even.shape[0], data_coco_even.shape[1], data_coco_even.shape[2], data_coco_even.shape[3] * 2))
+data_spha = torch.zeros((data_spha_even.shape[0], data_spha_even.shape[1], data_spha_even.shape[2], data_spha_even.shape[3] * 2))
+data_coco[:, :, :, ::2] = data_coco_even
+data_spha[:, :, :, ::2] = data_spha_even
+data_coco[:, :, :, 1::2] = data_coco_odd
+data_spha[:, :, :, 1::2] = data_spha_odd
+
+# trj = torch.load('/local_mount/space/mayday/data/users/abrahamd/hofft/data/coco_7t_spi/trj.pt')
+# ofs = 46
+# trj_skp = data_spha[1:4, ofs:ofs + trj.shape[0], :trj.shape[1], :] * fov / (2 * torch.pi)
+
 data = torch.cat([data_coco, data_spha], dim=0)
 crds = gen_grd(im_size)[:, :, :, :] * fov
 phis_coco = coco_bases(crds[..., 0], crds[..., 1], crds[..., 2])
-phis_spha = sph_bases(crds[..., 0], crds[..., 1], crds[..., 2])[4:]
-phis = torch.cat([phis_coco, phis_spha], dim=0) * mask
+phis_spha = sph_bases(crds[..., 0], crds[..., 1], crds[..., 2])
+phis = torch.cat([phis_coco, phis_spha], dim=0)
 alphas = data / (2 * torch.pi)
 
+# Save data
+torch.save(phis, '/local_mount/space/mayday/data/users/abrahamd/hofft/data/coco_7t_spi/phis.pt')
+torch.save(alphas, '/local_mount/space/mayday/data/users/abrahamd/hofft/data/coco_7t_spi/alphas.pt')
+quit()
+
 # Normalize
-phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis, alphas, norm_dists=False)
+phis_nrm, phis_mp, alphas_nrm, alphas_mp = rescale_phis_alphas(phis, alphas)
 phis = phis_nrm #+ phis_mp[:, None, None, None]
-alphas = alphas_nrm #+ alphas_mp[:, None,]
+alphas = alphas_nrm + alphas_mp[:, None,]
 
 plt.figure()
 for b in range(12):
