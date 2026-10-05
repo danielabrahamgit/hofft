@@ -1,0 +1,25 @@
+# Install with: python -m pip install -r requirements.txt
+# GPU execution requires a CUDA-enabled PyTorch installation and NVIDIA GPU.
+
+# HOFFT runtime dependencies
+torch
+numpy
+einops>=0.6.0
+matplotlib
+tqdm
+sigpy
+fast-pytorch-kmeans
+flash-kmeans
+triton
+
+# MRI reconstruction library (editable install includes its nested modules).
+-e git+https://github.com/danielabrahamgit/mr_recon.git#egg=mr_recon
+
+# Dependencies used by mr_recon that its package metadata does not declare.
+scipy
+torchkbnufft
+cufinufft
+pyeyes
+# CUDA 12.x CuPy wheels; replace with cupy-cuda11x for a CUDA 11.x environment.
+# Install only one CuPy distribution in an environment.
+cupy-cuda12x
