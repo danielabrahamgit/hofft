@@ -1,0 +1,868 @@
+"""
+This file contains the matrix-vector operations for high order phase integrals. 
+
+The forward matrix-vector operation is given by:
+y[t] = sum_r x[r] * exp(-j 2pi phi[r] * alpha[t])
+and the adjoint matrix-vector operation is given by:
+x[r] = sum_t y[t] * exp(j 2pi phi[r] * alpha[t])
+"""
+
+import torch
+import sigpy as sp
+import numpy as np
+
+from mr_recon.utils import torch_to_np, np_to_torch, resize
+from mr_recon.fourier import sigpy_nufft, fft, ifft
+from typing import Literal, Optional, Union
+from einops import einsum
+from tqdm import tqdm
+from .cur_ops import build_cur_factors, build_cur_factors_adaptive
+
+SubsampleMode = Literal['random', 'fixed']
+
+def subsample_count(size: int, 
+                    spec: Optional[Union[int, float]]) -> int:
+    """
+    Resolve a subsample specification to a sample count in [1, size].
+    None uses all elements; floats in (0, 1) are treated as fractions.
+    """
+    if spec is None:
+        return size
+    if isinstance(spec, float):
+        return max(1, min(size, int(size * spec)))
+    return max(1, min(size, int(spec)))
+
+def subsample_idx(size: int,
+                  count: int,
+                  device: torch.device,
+                  mode: SubsampleMode = 'random',
+                  seed: int = 0) -> torch.Tensor:
+    """
+    Return `count` distinct indices from {0, ..., size - 1}.
+    
+    mode='fixed' draws a reproducible subset (seeded). mode='random' redraws 
+    on every call.
+    """
+    if count >= size:
+        return torch.arange(size, device=device)
+    if mode == 'fixed':
+        gen = torch.Generator(device=device).manual_seed(seed)
+        return torch.randperm(size, generator=gen, device=device)[:count]
+    return torch.randperm(size, device=device)[:count]
+
+class matvec(torch.nn.Module):
+    """
+    Matrix-vector operation for the HOFFT model.
+    """
+
+    def __init__(self,
+                 phis: torch.Tensor,
+                 alphas: torch.Tensor,
+                 spatial_batch_size: Optional[int] = None,
+                 temporal_batch_size: Optional[int] = None,
+                 verbose: bool = False,
+                ):
+        """
+        Args
+        ----
+        phis : torch.Tensor
+            Spatial phase maps with shape (B, *im_size)
+        alphas : torch.Tensor
+            Temporal phase coefficients with shape (B, *trj_size)
+        spatial_batch_size : Optional[int]
+            Spatial batch size for the matrix-vector operation.
+        temporal_batch_size : Optional[int]
+            Temporal batch size for the matrix-vector operation.
+        spatial_weights : Optional[torch.Tensor]
+            Spatial weights with shape (*im_size)
+        temporal_weights : Optional[torch.Tensor]
+            Temporal weights with shape (*trj_size)
+        verbose : bool
+            Whether to print verbose output.
+        """
+        super(matvec, self).__init__()
+        self.phis = phis.to(torch.float32)
+        self.alphas = alphas.to(torch.float32)
+        self.im_size = self.phis.shape[1:]
+        self.trj_size = self.alphas.shape[1:]
+        self.ishape = self.im_size
+        self.oshape = self.trj_size
+        self.verbose = verbose
+        self.R = np.prod(self.im_size)
+        self.T = np.prod(self.trj_size)
+        self.B = self.phis.shape[0]
+        assert self.B == self.alphas.shape[0], 'Number of spatial and temporal phase maps must match.'
+        
+        # Batch sizes
+        if spatial_batch_size is None:
+            self.spatial_batch_size = np.prod(self.phis.shape[1:])
+        else:
+            self.spatial_batch_size = spatial_batch_size
+        if temporal_batch_size is None:
+            self.temporal_batch_size = np.prod(self.alphas.shape[1:])
+        else:
+            self.temporal_batch_size = temporal_batch_size
+            
+    def forward(self,
+                x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the matrix-vector operation.
+        
+        Args
+        ----
+        x : torch.Tensor
+            input signal to be multiplied with the matrix with shape (N, *im_size)
+        
+        Returns
+        -------
+        out : torch.Tensor
+            Output signal with shape (N, *trj_size)
+        """
+        raise NotImplementedError('Forward pass not implemented.')
+    
+    def adjoint(self,
+                y: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint pass of the matrix-vector operation.
+        
+        Args
+        ----
+        y : torch.Tensor
+            output signal to be multiplied with the matrix with shape (N, *trj_size)
+        
+        Returns
+        -------
+        x : torch.Tensor
+            Input signal with shape (N, *im_size)
+        """
+        raise NotImplementedError('Adjoint pass not implemented.')
+    
+    def normal(self,
+               x: torch.Tensor) -> torch.Tensor:
+        """
+        Normal pass of the matrix-vector operation.
+        
+        Args
+        ----
+        x : torch.Tensor
+            Input signal to be multiplied with the matrix with shape (N, *im_size)
+        
+        Returns
+        -------
+        y : torch.Tensor
+            Output signal with shape (N, *trj_size)
+        """
+        return self.adjoint(self.forward(x))
+
+class matvec_naive(matvec):
+    """
+    Matrix-vector operation for the HOFFT model using naive implementation.
+    """
+
+    def __init__(self,
+                 phis: torch.Tensor,
+                 alphas: torch.Tensor,
+                 **kwargs):
+        """
+        Args
+        ----
+        phis : torch.Tensor
+            Spatial phase maps with shape (B, *im_size)
+        alphas : torch.Tensor
+            Temporal phase coefficients with shape (B, *trj_size)
+        """
+        super(matvec_naive, self).__init__(phis, alphas, **kwargs)
+        
+        # Flatten phis and alphas
+        B = phis.shape[0]
+        self.phis = self.phis.reshape((B, -1))
+        self.alphas = self.alphas.reshape((B, -1))
+        
+    def forward(self,
+                x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the matrix-vector operation.
+        
+        Args
+        ----
+        x : torch.Tensor
+            Input signal to be multiplied with the matrix with shape (N, *im_size)
+        
+        Returns
+        -------
+        y : torch.Tensor
+            Output signal with shape (N, *trj_size)
+        """
+        # consts
+        N = x.shape[0]
+        T = self.T
+        R = self.R
+        
+        # Progress bar
+        pbar = tqdm(range(0, R, self.spatial_batch_size), 
+                    desc='Matvec Naive Forward', 
+                    disable=not self.verbose)
+        
+        # Perform the matrix-vector operation
+        x_flt = x.reshape((N, -1)) # N R
+        y_flt = torch.zeros((N, T), dtype=x.dtype, device=x.device)
+        for r1 in pbar:
+            r2 = min(r1 + self.spatial_batch_size, R)
+            for t1 in range(0, T, self.temporal_batch_size):
+                t2 = min(t1 + self.temporal_batch_size, T)
+                enc_mat = torch.exp(-2j * torch.pi * (self.phis[:, r1:r2].T @ self.alphas[:, t1:t2])) # R T
+                y_flt[:, t1:t2] += x_flt[:, r1:r2] @ enc_mat # N T
+        
+        # Reshape output
+        y = y_flt.reshape((N, *self.trj_size))
+        
+        return y
+    
+    def adjoint(self,
+                y: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint pass of the matrix-vector operation.
+        
+        Args
+        ----
+        y : torch.Tensor
+            Output signal to be multiplied with the matrix with shape (N, *trj_size)
+        
+        Returns
+        -------
+        x : torch.Tensor
+            Input signal with shape (N, *im_size)
+        """
+        # consts
+        N = y.shape[0]
+        R = self.R    
+        T = self.T
+        
+        # Progress bar
+        pbar = tqdm(range(0, R, self.spatial_batch_size),
+                    desc='Matvec Naive Adjoint',
+                    disable=not self.verbose)
+
+        # Perform the matrix-vector operation
+        y_flt = y.reshape((N, -1)) # N T
+        x_flt = torch.zeros((N, R), dtype=y.dtype, device=y.device)
+        for r1 in pbar:
+            r2 = min(r1 + self.spatial_batch_size, R)
+            for t1 in range(0, T, self.temporal_batch_size):
+                t2 = min(t1 + self.temporal_batch_size, T)
+                enc_mat = torch.exp(2j * torch.pi * (self.alphas[:, t1:t2].T @ self.phis[:, r1:r2])) # T R
+                x_flt[:, r1:r2] += y_flt[:, t1:t2] @ enc_mat
+        
+        # Reshape output
+        x = x_flt.reshape((N, *self.im_size))
+        
+        return x
+
+class matvec_type3(matvec):
+
+    def __init__(self,
+                 phis: torch.Tensor,
+                 alphas: torch.Tensor,
+                 oversamp: float = 1.25,
+                 width: float = 4.0,
+                 use_toep: Optional[bool] = False):
+        """
+        KB implimentation of the type-3 nufft as described in:
+        "A PARALLEL NONUNIFORM FAST FOURIER TRANSFORM LIBRARY 
+        BASED ON AN ``EXPONENTIAL OF SEMICIRCLE" KERNEL - Barnett et. al.
+        "https://epubs.siam.org/doi/pdf/10.1137/18M120885X
+
+        Args
+        -----
+        phis : torch.Tensor
+            The spatial phase maps, shape (B, *im_size)
+        alphas : torch.Tensor
+            The temporal phase coefficients, shape (B, *trj_size)
+        oversamp : float
+            The oversampling factor for spatial gridding
+        width : float
+            The width of the gridding kernel
+        use_toep : bool
+            toggles Topelitz for gram/normal/AHA operator
+        """    
+        # Consts
+        B, *im_size = phis.shape
+        B_, *trj_size = alphas.shape
+        R = np.prod(im_size)
+        T = np.prod(trj_size)
+        torch_dev = phis.device
+        assert B == B_, "phis and alphas must have same number of bases (B)"
+        assert phis.device == alphas.device, "phis and alphas must be on same device"
+        assert phis.dtype == alphas.dtype, "phis and alphas must have same dtype"
+        super(matvec_type3, self).__init__(phis, alphas, None, None)
+     
+        # Flatten everything
+        phis_flt = phis.reshape((B, R))
+        alphas_flt = alphas.reshape((B, T))
+        
+        # Center alphas and phis
+        phis_mp = (phis_flt.min(dim=1).values + phis_flt.max(dim=1).values)/2
+        alphas_mp = (alphas_flt.min(dim=1).values + alphas_flt.max(dim=1).values)/2
+        phis_flt_cent = phis_flt - phis_mp[:, None]
+        alphas_flt_cent = alphas_flt - alphas_mp[:, None]
+        
+        # Rescale phis to be between [-1/2, 1/2]
+        scales = phis_flt_cent.abs().max(dim=1).values * 2
+        phis_flt_cent /= scales[:, None]
+        phis_mp /= scales
+        alphas_flt_cent *= scales[:, None]
+        alphas_mp *= scales
+        
+        # Store phis, alphas, other constants
+        self.phis = phis_flt_cent
+        self.alphas = alphas_flt_cent
+        self.phis_mp = phis_mp
+        self.alphas_mp = alphas_mp
+        self.torch_dev = torch_dev
+        self.B = B
+        
+        # Consts for gridding
+        self.grd_S = self.alphas.abs().max(dim=1).values
+        self.grd_W = width
+        self.grd_N_os = torch.ceil(2 * self.grd_S * oversamp + self.grd_W).long()
+        self.grd_os = self.grd_N_os / (self.grd_N_os / oversamp).round() # FIXME?
+        self.grd_N = self.grd_N_os / self.grd_os
+        self.grd_gamma = self.grd_N_os / (2 * self.grd_os * self.grd_S)
+        self.grd_beta = np.pi * (((self.grd_W / self.grd_os) * (self.grd_os - 0.5))**2 - 0.8)**0.5
+        self.grd_N_os = tuple((self.grd_N * self.grd_os).ceil().long().tolist())
+        self.nft = sigpy_nufft(self.grd_N_os)
+        
+        # Optimize beta
+        self.nft.beta = self.nft.optimal_beta(torch_dev=torch_dev) # Better beta calculation
+        if use_toep:
+            # print('Computing toeplitz Kernels ... ', end='')
+            apod_weights = self.apod(self.alphas.T * self.grd_gamma / self.grd_N / self.grd_os, self.grd_beta, self.grd_W).prod(dim=-1)
+            self.kerns = self.nft.calc_teoplitz_kernels(trj=self.alphas.T[None,] * self.grd_gamma, weights=apod_weights[None,] ** 2)
+            # print('done.')
+        else:
+            self.kerns = None
+        
+    @staticmethod
+    def apod(x, beta, width):
+        eps = 1e-12
+        arg = (beta**2 - (np.pi * width * x) ** 2)
+        apod_pos = arg.clamp(min=0).sqrt()
+        apod_pos /= torch.sinh(apod_pos) + eps
+        apod_neg = (-arg.clamp(max=0)).sqrt()
+        apod_neg /= torch.sin(apod_neg) + eps
+        return apod_pos + apod_neg
+        
+    def forward(self,
+                x: torch.Tensor,) -> torch.Tensor:
+        """
+        Forward type 3 nufft.
+        
+        Args:
+        -----
+        x : torch.Tensor
+            The image to be transformed, shape (N, *im_size)
+        
+        Returns:
+        --------
+        y : torch.Tensor
+            The output with shape (N, *trj_size)
+        """
+        # Consts
+        N = x.shape[0]
+        
+        # ----------------- Step 0: Apply spatial midpoints -----------------
+        phz = self.phis.T @ self.alphas_mp
+        x_mp = x.reshape(N, -1) * torch.exp(-2j * torch.pi * phz)
+
+        # ----------------- Step 1: gridding in the image domain -----------------
+        # Compute shifts and scales
+        scales = (self.grd_os * self.grd_N).ceil() / self.grd_N
+        shifts = (self.grd_os * self.grd_N).ceil() // 2
+        
+        # Define output matrix size and betas
+        betas = tuple(self.grd_beta.tolist())
+        
+        # Move to cupy
+        x_cp_flt = torch_to_np(x_mp)
+        dev = sp.get_device(x_cp_flt)
+        with dev:
+            
+            # Rescale trajectory
+            trj = scales * (self.phis.T * self.grd_N / self.grd_gamma) + shifts
+            trj_cp = torch_to_np(trj)
+            
+            # Gridding
+            output = sp.interp.gridding(x_cp_flt, trj_cp, (N,) + self.grd_N_os,
+                                        kernel='kaiser_bessel', width=self.grd_W, param=betas)
+            x_grid = np_to_torch(output)
+            x_grid /= self.grd_W ** self.B
+            
+        # ----------------- Step 2: Call NUFFT on gridded data -----------------
+        alphas_rep = torch.repeat_interleave(self.alphas.T[None,], N, dim=0) # N T B
+        y_pre_apod = self.nft.forward(x_grid, alphas_rep * self.grd_gamma) # N T
+        y_pre_apod *= np.prod(self.grd_N_os) ** 0.5
+        
+        # ----------------- Step 3: Apodize -----------------
+        y = y_pre_apod * self.apod(alphas_rep * self.grd_gamma / self.grd_N / self.grd_os, self.grd_beta, self.grd_W).prod(dim=-1)
+        
+        # ----------------- Step 4: Apply temporal midpoints -----------------
+        phz = (self.alphas.T + self.alphas_mp) @ (self.phis_mp)
+        y = y * torch.exp(-2j * torch.pi * phz)
+        
+        # ----------------- Step 5: Reshape and Pray -----------------
+        return y.reshape((N, *self.trj_size))
+
+    def adjoint(self,
+                y: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint type 3 nufft.
+        
+        Args:
+        -----
+        y : torch.Tensor
+            The k-space data to be transformed, shape (N, *trj_size)
+        
+        Returns:
+        --------
+        x : torch.Tensor
+            The output with shape (N, *im_size)
+        """
+        # Consts
+        N = y.shape[0]
+        
+        # ----------------- Step 0: Apply temporal midpoints -----------------
+        phz = self.alphas.T @ self.phis_mp
+        y_mp = y.reshape((N, -1)) * torch.exp(2j * torch.pi * phz)
+        
+        # ----------------- Step 1: Apodize -----------------
+        alphas_rep = torch.repeat_interleave(self.alphas.T[None,], N, dim=0) # N T B
+        y_apod = y_mp * self.apod(alphas_rep * self.grd_gamma / self.grd_N / self.grd_os, self.grd_beta, self.grd_W).prod(dim=-1)
+        
+        # ----------------- Step 2: Call Adjoint NUFFT -----------------
+        x_grid = self.nft.adjoint(y_apod, alphas_rep * self.grd_gamma) # N *self.grd_N_os
+        x_grid *= np.prod(self.grd_N_os) ** 0.5
+        
+        # ----------------- Step 3: Interpolation in the image domain -----------------
+        # Compute shifts and scales
+        scales = (self.grd_os * self.grd_N).ceil() / self.grd_N
+        shifts = (self.grd_os * self.grd_N).ceil() // 2
+        
+        # Define output matrix size and betas
+        betas = tuple(self.grd_beta.tolist())
+
+        # Move to cupy
+        x_grid_cp = torch_to_np(x_grid)
+        dev = sp.get_device(x_grid_cp)
+        with dev:
+            
+            # Rescale trajectory
+            trj = scales * (self.phis.T * self.grd_N / self.grd_gamma) + shifts
+            trj_cp = torch_to_np(trj)
+            
+            # Interpolate
+            output = sp.interp.interpolate(x_grid_cp, trj_cp,
+                                           kernel='kaiser_bessel', width=self.grd_W, param=betas)
+            x = np_to_torch(output)
+            x /= self.grd_W ** self.B
+
+        # ----------------- Step 4: Apply spatial midpoints -----------------
+        phz = (self.phis.T + self.phis_mp) @ self.alphas_mp
+        x = x * torch.exp(2j * torch.pi * phz)
+        
+        # ----------------- Step 5: Reshape and pray -----------------
+        return x.reshape((N, *self.im_size))
+
+    def normal(self,
+               x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies normal operator
+        
+        Args:
+        -----
+        x : torch.Tensor
+            The image to be transformed, shape (N, *im_size)
+            
+        Returns:
+        --------
+        torch.Tensor
+            The output with shape (N, *im_size)
+        """
+        if self.kerns is None:
+            return self.adjoint(self.forward(x))
+        else:
+            # Consts
+            N = x.shape[0]
+            B = self.phis.shape[0]
+            
+            # ----------------- Step 0: Apply spatial midpoints -----------------
+            phz = (self.phis.T + self.phis_mp) @ self.alphas_mp
+            x_mp = x.reshape(N, -1) * torch.exp(-2j * torch.pi * phz)
+
+            # ----------------- Step 1: gridding in the image domain -----------------
+            # Compute shifts and scales
+            scales = (self.grd_os * self.grd_N).ceil() / self.grd_N
+            shifts = (self.grd_os * self.grd_N).ceil() // 2
+            
+            # Define output matrix size and betas
+            betas = tuple(self.grd_beta.tolist())
+
+            # Move to cupy
+            x_cp_flt = torch_to_np(x_mp)
+            dev = sp.get_device(x_cp_flt)
+            with dev:
+                
+                # Rescale trajectory
+                trj = scales * (self.phis.T * self.grd_N / self.grd_gamma) + shifts
+                trj_cp = torch_to_np(trj)
+                
+                # Gridding
+                output = sp.interp.gridding(x_cp_flt, trj_cp, (N,) + self.grd_N_os,
+                                                kernel='kaiser_bessel', width=self.grd_W, param=betas)
+                x_grid = np_to_torch(output)
+                x_grid /= self.grd_W ** self.B
+                
+            # ----------------- Step 2: Apply toeplitz kernels -----------------
+            x_zp = resize(x_grid, [N,] + [self.grd_N_os[i] * 2 for i in range(B)])
+            x_ft = fft(x_zp, dim=tuple(range(-B, 0)))
+            x_tp = x_ft * self.kerns
+            x_ift = ifft(x_tp, dim=tuple(range(-B, 0)))
+            x_crp = resize(x_ift, (N, *self.grd_N_os))
+            x_grid = x_crp
+            x_grid *= np.prod(self.grd_N_os)
+            
+            # ----------------- Step 3: Interpolation in the image domain -----------------
+            # Compute shifts and scales
+            scales = (self.grd_os * self.grd_N).ceil() / self.grd_N
+            shifts = (self.grd_os * self.grd_N).ceil() // 2
+            
+            # Define output matrix size and betas
+            betas = tuple(self.grd_beta.tolist())
+
+            # Move to cupy
+            x_grid_cp = torch_to_np(x_grid)
+            dev = sp.get_device(x_grid_cp)
+            with dev:
+                
+                # Rescale trajectory
+                trj = scales * (self.phis.T * self.grd_N / self.grd_gamma) + shifts
+                trj_cp = torch_to_np(trj)
+                
+                # Interpolate
+                output = sp.interp.interpolate(x_grid_cp, trj_cp,
+                                               kernel='kaiser_bessel', width=self.grd_W, param=betas)
+                x = np_to_torch(output)
+                x /= self.grd_W ** self.B
+
+            # ----------------- Step 4: Apply spatial midpoints -----------------
+            phz = (self.phis.T + self.phis_mp) @ self.alphas_mp
+            x = x * torch.exp(2j * torch.pi * phz)
+            
+            # ----------------- Step 5: Reshape and pray -----------------
+            return x.reshape((N, *self.ishape))
+ 
+class matvec_cur(matvec):
+
+    def __init__(self,
+                 phis: torch.Tensor,
+                 alphas: torch.Tensor,
+                 cur_rank: Optional[int] = None,
+                 rank_phi: Optional[int] = None,
+                 rank_alpha: Optional[int] = None,
+                 cluster_method: str = 'maxmin',
+                 normalize_method: str = 'svd',
+                 normalize_coeffs: Optional[bool] = None,
+                 seed: int = 0,
+                 **kwargs):
+        """
+        Args
+        ----
+        phis : torch.Tensor
+            Spatial phase maps with shape (B, *im_size). When S is given this
+            is V^T from A^T Φ = U Σ V^T.
+        alphas : torch.Tensor
+            Temporal phase coefficients with shape (B, *trj_size). When S is
+            given this is U^T.
+        cur_rank : Optional[int]
+            < 0 uses adaptive-rank CUR; > 0 is the fixed CUR rank when
+            rank_phi / rank_alpha are None. None with no rank_phi/rank_alpha
+            also uses adaptive (legacy).
+        rank_phi : Optional[int]
+            number of spatial (phi) representatives
+        rank_alpha : Optional[int]
+            number of temporal (alpha) representatives
+        cluster_method : str
+            'maxmin' (default) or 'kmeans'
+        normalize_method : str
+            'rescale', 'cov', 'mahal', 'svd', or '' (no normalization)
+        normalize_coeffs : Optional[bool]
+            Deprecated. True → 'rescale', False → ''.
+        seed : int
+            RNG seed for the first maxmin pivot
+        """
+        super(matvec_cur, self).__init__(phis, alphas, **kwargs)
+        if normalize_coeffs is not None:
+            normalize_method = 'rescale' if normalize_coeffs else ''
+
+        phis_flt = phis.reshape((self.B, -1))
+        alphas_flt = alphas.reshape((self.B, -1))
+        
+        if (cur_rank is not None and cur_rank < 0) or (
+            cur_rank is None and rank_phi is None and rank_alpha is None
+        ):
+            R, C, cur_rank = build_cur_factors_adaptive(
+                phis_flt, alphas_flt,
+                normalize_method=normalize_method,
+                cluster_method=cluster_method,
+                seed=seed,
+                verbose=True,
+            )            
+        else:
+            R, C = build_cur_factors(
+                phis_flt, alphas_flt,
+                normalize_method=normalize_method,
+                rank=cur_rank,
+                rank_phi=rank_phi,
+                rank_alpha=rank_alpha,
+                cluster_method=cluster_method,
+                seed=seed,
+            )
+        K = R.shape[0]
+        self.curR = R.reshape((K, *self.im_size))
+        self.curC = C.reshape((K, *self.trj_size))
+        self.normal_factor = einsum(self.curC.conj(), self.curC, 'Kl ..., Kr ... -> Kl Kr')
+        
+    def forward(self,
+                x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the matrix-vector operation.
+        
+        Args
+        ----
+        x : torch.Tensor
+            Input signal to be multiplied with the matrix with shape (N, *im_size)
+        
+        Returns
+        -------
+        y : torch.Tensor
+            Output signal with shape (N, *trj_size)
+        """
+        # Consts
+        N = x.shape[0]
+        
+        # Perform the CUR decomposition
+        coeffs = einsum(x, self.curR, 'N ..., K ... -> N K')
+        y = einsum(coeffs, self.curC, 'N K, K ... -> N ...')
+        
+        return y
+    
+    def adjoint(self,
+                y: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint pass of the matrix-vector operation.
+        
+        Args
+        ----
+        y : torch.Tensor
+            Output signal to be multiplied with the matrix with shape (N, *trj_size)
+            
+        Returns
+        -------
+        x : torch.Tensor
+            Input signal with shape (N, *im_size)
+        """
+        # Consts
+        N = y.shape[0]
+        
+        # Perform the CUR decomposition
+        coeffs = einsum(y, self.curC.conj(), 'N ..., K ... -> N K')
+        x = einsum(coeffs, self.curR.conj(), 'N K, K ... -> N ...')
+        
+        return x
+    
+    def normal(self,
+               x: torch.Tensor) -> torch.Tensor:
+        """
+        Normal pass of the matrix-vector operation.
+        
+        Args
+        ----
+        x : torch.Tensor
+            Input signal to be multiplied with the matrix with shape (N, *im_size)
+            
+        Returns
+        -------
+        y : torch.Tensor
+            Output signal with shape (N, *im_size)
+        """
+        # return self.adjoint(self.forward(x))
+        coeffs = einsum(x, self.curR, 'N ..., K ... -> N K')
+        coeffs = einsum(coeffs, self.normal_factor, 'N K, Ko K -> N Ko')
+        return einsum(coeffs, self.curR.conj(), 'N K, K ... -> N ...')
+
+class matvec_rnd(matvec):
+    """
+    On each call, randomly sample a subset of the phis and alphas to use for the matrix-vector operation.
+    """
+    
+    def __init__(self,
+                 phis: torch.Tensor,
+                 alphas: torch.Tensor,
+                 rnd_frac_phis: float = 0.1,
+                 rnd_frac_alphas: float = 0.1,
+                 **kwargs):
+        super(matvec_rnd, self).__init__(phis, alphas, **kwargs)
+        self.rnd_frac_phis = rnd_frac_phis
+        self.rnd_frac_alphas = rnd_frac_alphas
+        
+        # Flatten phis and alphas
+        B = phis.shape[0]
+        self.phis = self.phis.reshape((B, -1))
+        self.alphas = self.alphas.reshape((B, -1))
+        
+    def forward(self,
+                x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the matrix-vector operation.
+        
+        Args
+        ----
+        x : torch.Tensor
+            Input signal to be multiplied with the matrix with shape (N, *im_size)
+        
+        Returns
+        -------
+        y : torch.Tensor
+            Output signal with shape (N, *trj_size)
+        """
+        # Consts    
+        N = x.shape[0]
+        B = self.B
+        R = self.phis.shape[1]
+        
+        # Flatten input
+        x_flt = x.reshape((N, -1))
+        
+        # Randomly sample voxels
+        voxel_inds = torch.randperm(R)[:int(R * self.rnd_frac_phis)]
+        
+        # Perform the matrix-vector operation
+        enc_mat = torch.exp(-2j * torch.pi * (self.phis[:, voxel_inds].T @ self.alphas)) # R' T
+        y_flt = x_flt[:, voxel_inds] @ enc_mat # N T
+    
+        # Reshape output
+        y = y_flt.reshape((N, *self.trj_size))
+        
+        return y
+
+    def adjoint(self,
+                y: torch.Tensor) -> torch.Tensor:
+        """
+        Adjoint pass of the matrix-vector operation.
+        
+        Args
+        ----
+        y : torch.Tensor
+            Output signal to be multiplied with the matrix with shape (N, *trj_size)
+        """
+        # Consts
+        N = y.shape[0]
+        T = self.T
+        
+        # Flatten input
+        y_flt = y.reshape((N, -1))
+        
+        # Randomly sample alphas
+        temporal_inds = torch.randperm(T)[:int(T * self.rnd_frac_alphas)]
+        
+        # Perform the matrix-vector operation
+        enc_mat = torch.exp(2j * torch.pi * (self.alphas[:, temporal_inds].T @ self.phis)) # T' R
+        x_flt = y_flt[:, temporal_inds] @ enc_mat # N R
+    
+        # Reshape output
+        x = x_flt.reshape((N, *self.im_size))
+        
+        return x
+
+class matvec_rnd_fast(matvec):
+    """
+    Fixed random spatial sketch of the phase encoding matvec.
+
+    Same approximation idea as ``matvec_rnd`` (sum only over a random voxel
+    subset), but the subset and the sketched encoding block
+    ``A[I, :] = exp(-2pi j phi_I · alpha)`` are built once at init. Forward is
+    a single matmul against that cached block — no per-call ``exp`` and no CUR
+    / ``pinv`` coupling. The adjoint is the exact adjoint of this sketched
+    forward (support restricted to ``I``), so ``normal = A^H A`` is consistent.
+    """
+
+    def __init__(self,
+                 phis: torch.Tensor,
+                 alphas: torch.Tensor,
+                 rnd_frac_phis: float = 0.1,
+                 rnd_frac_alphas: float = 0.1,
+                 rank_phi: Optional[int] = None,
+                 seed: int = 0,
+                 rescale: bool = True,
+                 spatial_batch_size: Optional[int] = None,
+                 temporal_batch_size: Optional[int] = None):
+        """
+        Args
+        ----
+        phis : torch.Tensor
+            Spatial phase maps with shape (B, *im_size)
+        alphas : torch.Tensor
+            Temporal phase coefficients with shape (B, *trj_size)
+        rnd_frac_phis : float
+            Fraction of voxels in the sketch (ignored if ``rank_phi`` is set).
+        rnd_frac_alphas : float
+            Unused (kept for API parity with ``matvec_rnd``). Forward sketches
+            space only; the adjoint matches that sketched operator.
+        rank_phi : Optional[int]
+            Explicit sketch size (number of voxels).
+        seed : int
+            RNG seed for the fixed voxel draw.
+        rescale : bool
+            If True, scale by ``R / |I|`` for an unbiased Monte Carlo estimate
+            of the full spatial sum.
+        spatial_batch_size, temporal_batch_size : Optional[int]
+            ``temporal_batch_size`` controls how the cached ``A[I, :]`` is built.
+        """
+        super(matvec_rnd_fast, self).__init__(
+            phis, alphas, spatial_batch_size, temporal_batch_size)
+        _ = rnd_frac_alphas  # API parity only
+
+        phis_flt = self.phis.reshape((self.B, -1))
+        alphas_flt = self.alphas.reshape((self.B, -1))
+        R = phis_flt.shape[1]
+        T = alphas_flt.shape[1]
+        Rp = rank_phi if rank_phi is not None else subsample_count(R, rnd_frac_phis)
+
+        voxel_inds = subsample_idx(R, Rp, phis_flt.device, mode='fixed', seed=seed)
+        phis_I = phis_flt[:, voxel_inds]  # (B, R')
+
+        # Build A[I, :] once, batched over time to limit peak memory.
+        enc = torch.empty((Rp, T), dtype=torch.complex64, device=phis_flt.device)
+        tb = self.temporal_batch_size
+        for t1 in range(0, T, tb):
+            t2 = min(t1 + tb, T)
+            enc[:, t1:t2] = torch.exp(
+                -2j * torch.pi * (phis_I.T @ alphas_flt[:, t1:t2])
+            )
+
+        self.voxel_inds = voxel_inds
+        self.enc_mat = enc                          # (R', T)
+        self.scale = (R / Rp) if rescale else 1.0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        N = x.shape[0]
+        x_I = x.reshape((N, -1))[:, self.voxel_inds]  # (N, R')
+        y_flt = self.scale * (x_I @ self.enc_mat)     # (N, T)
+        return y_flt.reshape((N, *self.trj_size))
+
+    def adjoint(self, y: torch.Tensor) -> torch.Tensor:
+        N = y.shape[0]
+        y_flt = y.reshape((N, -1))                    # (N, T)
+        x_I = self.scale * (y_flt @ self.enc_mat.conj().T)  # (N, R')
+        x_flt = torch.zeros((N, self.R), dtype=y.dtype, device=y.device)
+        x_flt[:, self.voxel_inds] = x_I
+        return x_flt.reshape((N, *self.im_size))

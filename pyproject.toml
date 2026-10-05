@@ -11,5 +11,5 @@ version = "0.0.1"
 authors = [
   { name="Daniel Abraham", email="abrahamd@stanford.edu" },
 ]
-description = "A package for modeling high order phases in MRI"
+description = "Simulation and optimization tool for magnetic fields in MRI applications"
 readme = "README.md"
